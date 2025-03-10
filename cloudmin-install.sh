@@ -1095,7 +1095,7 @@ post_install_message() {
   log_success "If there were no errors above, Cloudmin should be ready to configure"
   log_success "at https://${hostname}:10000 (or https://${address}:10000)."
   if [ -z "$ssl_host_success" ]; then
-    log_success "You may receive a security warning in your browser on your first visit."
+    log_success "You will see a security warning in the browser on your first visit."
   fi
 }
 
