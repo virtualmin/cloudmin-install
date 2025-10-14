@@ -8,8 +8,8 @@
 # https://www.cloudmin.com/docs/installation/guides
 
 # License and version
-SERIAL=5566642
-KEY=Tf8upwX6os
+SERIAL=GPL
+KEY=GPL
 VER=10.0.0
 cm_version=10
 
