@@ -68,3 +68,4 @@ jobs:
           upload_list=("cloudmin-install.sh" "$cloudmin_install_versioned")
           delete_list=("$CLOUD_UPLOAD_SSH_DIR cloudmin-install * *sh")
           cloud_upload upload_list delete_list
+          cloud_sync_remote_repos
