@@ -1,4 +1,4 @@
-name: "cloudmin.dev: virtualmin/cloudmin-install"
+name: Build
 
 on:
   push:
