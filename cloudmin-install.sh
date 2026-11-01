@@ -1,52 +1,24 @@
 #!/bin/sh
-# shellcheck disable=SC2059 disable=SC2181 disable=SC2154 disable=SC2317 disable=SC2034
-# cloudmin-install.sh
-# Copyright 2005-2025 Cloudmin
-# Simple script to install Cloudmin on a supported OS
+# Copyright 2005-2026 Cloudmin
+# Copyright 2005-2026 The Webmin Developers
+# Install Cloudmin on a supported Linux host.
+# shellcheck disable=SC1090,SC1091,SC2034,SC2154,SC3043,SC2059
 
-# Different installation guides are available at:
-# https://www.cloudmin.com/docs/installation/guides
+VER=10.0.0-RC1
 
-# License and version
-SERIAL=GPL
-KEY=GPL
-VER=10.0.0
-cm_version=10
+# Hide branch help and warnings during development; set to 0 to show them.
+# Removing this declaration also restores the normal branch help and warning.
+CLOUDMIN_DEVELOPMENT="${CLOUDMIN_DEVELOPMENT:-1}"
 
-# Server
-download_cloudmin_host="${download_cloudmin_host:-software.cloudmin.com}"
-download_cloudmin_host_lib="$download_cloudmin_host/lib"
-download_cloudmin_host_dev="${download_cloudmin_host_dev:-software.cloudmin.dev}"
-download_cloudmin_host_rc="${download_cloudmin_host_rc:-rc.software.cloudmin.dev}"
+# Download servers can be overridden through the environment.
+# Cloudmin currently publishes only the unstable channel.
+download_cloudmin_host="${download_cloudmin_host:-download.cloudmin.dev}"
+download_cloudmin_host_lib="$download_cloudmin_host"
+download_cloudmin_host_dev="${download_cloudmin_host_dev:-$download_cloudmin_host}"
+download_webmin_host="${download_webmin_host:-download.webmin.com}"
 download_webmin_host_dev="${download_webmin_host_dev:-download.webmin.dev}"
-download_webmin_host_rc="${download_webmin_host_rc:-rc.download.webmin.dev}"
 
-# Save current working directory
-pwd="$PWD"
-
-# License file
-cloudmin_license_file="/etc/server-manager-license"
-# cloudmin_license_file="/etc/cloudmin-license"
-# cloudmin_license_file_alt="/etc/server-manager-license"
-# if [ -f "$cloudmin_license_file_alt" ]; then
-#   cloudmin_license_file="$cloudmin_license_file_alt"
-# fi
-
-# Script name
-if [ "$0" = "--" ] || [ -z "$0" ]; then
-  script_name="cloudmin-install.sh"
-else
-  script_name=$(basename -- "$0")
-fi
-
-# Set log type
-log_file_name="${install_log_file_name:-cloudmin-install}"
-
-# Set defaults
-bundle='KVM'
-mode="${mode:-install}" # Other options are mini/micro/nano
-skipyesno=0
-
+# usage() Documents the supported installation and standalone swap controls.
 usage() {
   # shellcheck disable=SC2046
   echo
@@ -55,53 +27,728 @@ usage() {
   echo "  If called without arguments, installs Cloudmin with default options."
   echo
   printf "  --bundle|-b <KVM>                bundle to install (default: KVM)\\n"
+  # Development builds use the unstable channel without advertising a switch.
+  if [ "${CLOUDMIN_DEVELOPMENT:-0}" != 1 ]; then
+    printf "  --branch|-B <unstable>            install branch (default: unstable)\\n"
+  fi
   echo
-  printf "  --branch|-B <stable|unstable|prerelease>\\n"
-  printf "                                   install branch (default: stable)\\n"
-  printf "  --os-grade|-g <A|B>              operating system support grade (default: A)\\n"
+  printf "  --extra|-E <name[,name..]>       install extra packages with the stack\\n"
+  printf "  --exclude|-e <name[,name..]>     exclude plugin from configuration phase\\n"
+  printf "  --include|-i <name[,name..]>     include plugin in configuration phase\\n"
+  printf "  --module|-o <name>               load custom module in post-install phase\\n"
   echo
-  printf "  --module|-o                      load custom module in post-install phase\\n"
-  echo
-  printf "  --hostname|-n                    force hostname during install\\n"
+  printf "  --hostname|-n <name>             force hostname during install\\n"
   printf "  --no-package-updates|-x          skip package updates during install\\n"
   echo
+  printf "  --swap|-S <size>                 managed swap: MiB or K/M/G[B]; 0 to remove\\n"
+  printf "  --swap-only                      configure swap without installing\\n"
+  printf "  --no-swap|-ns                    leave system swap unchanged\\n"
+  echo
+  printf "  --uninstall|-u                   remove Cloudmin packages and repositories\\n"
   printf "  --setup|-s                       reconfigure repos without installing\\n"
   printf "  --connect|-C <ipv4|ipv6>         test connectivity without installing\\n"
+  printf "  --insecure-downloads|-I          skip SSL certificate check for downloads\\n"
   echo
-  printf "  --insecure-downloads|-i          skip SSL certificate check for downloads\\n"
-  echo
-  printf "  --uninstall|-u                   remove all packages and dependencies\\n"
+  printf "  --log-dir <directory>            directory for installer logs\\n"
   echo
   printf "  --force|-f|--yes|-y              assume \"yes\" to all prompts\\n"
   printf "  --force-reinstall|-fr            force complete reinstall (not recommended)\\n"
   printf "  --no-banner|-nb                  suppress installation messages and warnings\\n"
-  printf "  --verbose|-v                     enable verbose mode\\n"
-  printf "  --version|-V                     show installer version\\n"
+  printf "  --verbose|-V                     enable verbose mode\\n"
+  echo
+  printf "  --version|-v                     show installer version\\n"
   printf "  --help|-h                        show this help\\n"
   echo
 }
 
-# Bind hooks
+# Report argument errors before the shared logger is loaded.
+log_error() {
+  if [ -t 2 ] && [ "${INTERACTIVE_MODE:-}" != off ] && command -v tput >/dev/null 2>&1; then
+    printf '%s[ERROR]%s %s\n' "$(tput setaf 1 2>/dev/null)" "$(tput sgr0 2>/dev/null)" "$1" >&2
+  else
+    printf '[ERROR] %s\n' "$1" >&2
+  fi
+}
+
+# fail(message) Reports errors before and after the shared logger is available.
+fail() {
+  log_error "$*"
+  exit 1
+}
+
+# bind_hook(name, [args...]) Calls an override, or pre/original/post hooks.
 bind_hook() {
-    hook="$1"
-    shift
-    pre_hook="pre_hook__$hook"
-    post_hook="post_hook__$hook"
-    # Do we want to completely override the original function?
-    if command -v "hook__$hook" > /dev/null 2>&1; then
-        "hook__$hook" "$@"
-    # Or do we want to run the original function wrapped by third-party functions?
-    else
-        if command -v "$pre_hook" > /dev/null 2>&1; then
-            "$pre_hook" "$@"
-        fi
-        if command -v "$hook" > /dev/null 2>&1; then
-            "$hook" "$@"
-        fi
-        if command -v "$post_hook" > /dev/null 2>&1; then
-            "$post_hook" "$@"
-        fi
+  local hook="$1"
+  shift
+  if command -v "hook__$hook" >/dev/null 2>&1; then
+    "hook__$hook" "$@"
+  else
+    if command -v "pre_hook__$hook" >/dev/null 2>&1; then
+      "pre_hook__$hook" "$@" || return $?
     fi
+    if command -v "$hook" >/dev/null 2>&1; then
+      "$hook" "$@" || return $?
+    fi
+    if command -v "post_hook__$hook" >/dev/null 2>&1; then
+      "post_hook__$hook" "$@" || return $?
+    fi
+    return 0
+  fi
+}
+
+# swap_size(value) Validates a size and converts it to KiB, rounded up to MiB.
+swap_size() {
+  swap_arg=$1
+  swap_num=${swap_arg%%[!0-9]*}
+  swap_suffix=${swap_arg#"$swap_num"}
+  case "$swap_suffix" in
+    [Kk]|[Kk][Bb]) swap_mult=1 ;;
+    [Mm]|[Mm][Bb]|'') swap_mult=1024 ;;
+    [Gg]|[Gg][Bb]) swap_mult=1048576 ;;
+    *) fail "Invalid swap size: $swap_arg" ;;
+  esac
+  swap_num=${swap_num#"${swap_num%%[!0]*}"}
+  if [ -z "${swap_arg%%[!0-9]*}" ] || [ "${#swap_num}" -gt 10 ]; then
+    fail "Invalid swap size: $swap_arg"
+  fi
+  swap_num=${swap_num:-0}
+  [ "$swap_num" -le $((1073740800 / swap_mult)) ] || fail "Invalid swap size: $swap_arg"
+  swapsize=$(((swap_num * swap_mult + 1023) / 1024 * 1024))
+}
+
+# require_value(option, [value]) Rejects missing option values before side effects.
+require_value() {
+  [ -n "${2:-}" ] || fail "$1 requires a value"
+  case "$2" in -*) fail "$1 requires a value" ;; esac
+}
+
+# parse_options(args) Validates all options before inspecting or changing the host.
+parse_options() {
+  branch=unstable; setup=; swap_only=; noswap=; swapsize=; skipyesno=0
+  hostname_arg=; no_updates=; extra=; includes=; excludes=; VERBOSE=0
+  forcereinstall=; skipbanner=; module_name=; insecure_downloads=; connect=; uninstall_mode=
+  bundle=KVM; showversion=
+  log_dir=/root
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --help|-h) bind_hook usage; exit 0 ;;
+      --version|-v) showversion=1; shift ;;
+      --branch|-B|--hostname|-n|--extra|-E|--include|-i|--exclude|-e|--log-dir|--swap|-S|--module|-o|--bundle|-b)
+        require_value "$1" "${2:-}"
+        case "$1" in
+          --branch|-B) branch=$2 ;;
+          --hostname|-n) hostname_arg=$2 ;;
+          --extra|-E) extra="${extra:+$extra,}$2" ;;
+          --include|-i) includes="${includes:+$includes,}$2" ;;
+          --exclude|-e) excludes="${excludes:+$excludes,}$2" ;;
+          --log-dir) log_dir=$2 ;;
+          --swap|-S) swap_size "$2" ;;
+          --module|-o) module_name=$2 ;;
+          --bundle|-b) bundle=$2 ;;
+        esac
+        shift 2 ;;
+      --setup|-s) setup=1; shift ;;
+      --swap-only) swap_only=1; shift ;;
+      --no-swap|-ns) noswap=1; shift ;;
+      --yes|-y|--force|-f) skipyesno=1; shift ;;
+      --no-package-updates|-x) no_updates=1; shift ;;
+      --verbose|-V) VERBOSE=1; shift ;;
+      --force-reinstall|-fr) forcereinstall=1; shift ;;
+      --no-banner|-nb) skipbanner=1; shift ;;
+      --insecure-downloads|-I) insecure_downloads=1; shift ;;
+      --uninstall|-u) uninstall_mode=1; shift ;;
+      --connect|-C)
+        connect='ipv4 ipv6'; shift
+        case "${1:-}" in
+          ipv4|ipv6) connect=$1; shift ;;
+          ''|-*) ;;
+          *) fail "Invalid protocol: $1" ;;
+        esac ;;
+      *) fail "Unknown option: $1" ;;
+    esac
+  done
+  case "$branch" in testing|development|devel|dev|nightly|bleeding-edge|cutting-edge) branch=unstable ;; esac
+  [ "$branch" = unstable ] || fail 'Only the unstable repository is available'
+  [ "$bundle" = KVM ] || fail "Unknown bundle: $bundle"
+  case "$module_name" in *[!A-Za-z0-9_.-]*|.*) fail 'Invalid module name' ;; esac
+  [ -z "$uninstall_mode" ] || [ -z "$setup$swap_only$swapsize$noswap$connect$hostname_arg$extra$includes$excludes$module_name" ] ||
+    fail '--uninstall cannot be combined with setup, swap or installation options'
+  [ -z "$connect" ] || [ -z "$setup$swap_only$swapsize$noswap$uninstall_mode$hostname_arg$extra$includes$excludes$module_name" ] ||
+    fail '--connect cannot be combined with setup, swap or installation options'
+  [ -z "$noswap" ] || [ -z "$swapsize" ] || fail 'Options --swap and --no-swap are mutually exclusive'
+  [ -z "$setup" ] || [ -z "$swap_only$swapsize" ] || fail '--setup cannot be combined with swap changes'
+  [ -z "$setup" ] || [ -z "$hostname_arg$extra$includes$excludes$no_updates$module_name" ] ||
+    fail '--setup cannot be combined with installation options'
+  [ -z "$swap_only" ] || [ -z "$hostname_arg$extra$includes$excludes$no_updates$module_name" ] ||
+    fail '--swap-only cannot be combined with installation options'
+  case "$log_dir" in /*) ;; *) fail '--log-dir must be an absolute path' ;; esac
+  if [ -n "$hostname_arg" ]; then
+    printf '%s\n' "$hostname_arg" | LC_ALL=C grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$' ||
+      fail 'Provide a fully qualified host name'
+  fi
+  # Only literal package and plugin names reach the package manager or the configuration tool.
+  if [ -n "$extra" ]; then
+    printf '%s\n' "$extra" | LC_ALL=C grep -Eq '^[a-zA-Z0-9][a-zA-Z0-9+_.-]*(,[a-zA-Z0-9][a-zA-Z0-9+_.-]*)*$' ||
+      fail 'Invalid extra package list'
+  fi
+  for names in "$includes" "$excludes"; do
+    [ -z "$names" ] || printf '%s\n' "$names" | LC_ALL=C grep -Eq '^[A-Za-z][A-Za-z0-9]*(,[A-Za-z][A-Za-z0-9]*)*$' ||
+      fail 'Invalid configuration plugin list'
+  done
+}
+
+# parse_args(args...) Parses options and selects the utility library host.
+parse_args() {
+  parse_options "$@"
+  # Select the utility library from the same branch as the Cloudmin packages.
+  if [ "$branch" = unstable ]; then
+    download_cloudmin_host_lib="$download_cloudmin_host_dev"
+  fi
+}
+
+# show_version() Prints the installer version.
+show_version() {
+  printf '%s\n' "$VER"
+}
+
+# supported_host(id, version, architecture) Keeps package selection explicit.
+supported_host() {
+  case "$1:$3" in
+    rocky:x86_64|rocky:aarch64|almalinux:x86_64|almalinux:aarch64)
+      printf '%s\n' "$2" | LC_ALL=C grep -Eq '^10([.][0-9]+)*$' ;;
+    debian:x86_64|debian:aarch64)
+      printf '%s\n' "$2" | LC_ALL=C grep -Eq '^13([.][0-9]+)*$' ;;
+    ubuntu:x86_64|ubuntu:aarch64) [ "$2" = 26.04 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# preflight() Rejects unsupported systems before downloads, swap or package changes.
+preflight() {
+  [ "$(uname -s)" = Linux ] || fail 'Run this installer on a Linux host'
+  [ "$(id -u)" = 0 ] || fail 'Run this installer as root'
+  # Standalone swap management does not configure a Cloudmin host.
+  [ -z "$swap_only" ] || return 0
+  [ -r /etc/os-release ] || fail 'Cannot determine the operating system'
+  . /etc/os-release
+  supported_host "${ID:-}" "${VERSION_ID:-}" "$(uname -m)" ||
+    fail 'Supported hosts: Rocky/AlmaLinux 10, Debian 13 and Ubuntu 26.04, x86_64 or aarch64'
+  [ -d /run/systemd/system ] || fail 'A running systemd host is required'
+  [ -n "$setup$uninstall_mode" ] || [ -c /dev/kvm ] || fail 'KVM is unavailable; enable hardware or nested virtualization'
+  if [ -z "$setup$uninstall_mode$forcereinstall" ] && is_installed; then
+    bind_hook already_installed_block
+    return 1
+  fi
+  case "$ID" in
+    debian|ubuntu) manager=apt-get; export DEBIAN_FRONTEND=noninteractive ;;
+    *) manager=dnf ;;
+  esac
+  command -v "$manager" >/dev/null 2>&1 || fail "$manager is required"
+}
+
+# finish() Removes only this invocation's private workspace and keeps its exit status.
+finish() {
+  result=$?
+  trap - EXIT HUP INT TERM QUIT
+  if [ "${INTERACTIVE_MODE:-off}" != off ]; then
+    stty echo 2>/dev/null || :
+    for pid in $allpids; do kill "$pid" 2>/dev/null || :; done
+    tput cnorm 2>/dev/null || :
+    tput sgr0 2>/dev/null || :
+  fi
+  [ -z "${CLOUDMIN_INSTALL_TEMPDIR:-}" ] || rm -rf -- "$CLOUDMIN_INSTALL_TEMPDIR"
+  exit "$result"
+}
+
+# fetch(url, path) Requires HTTPS and stops on HTTP or download failure.
+fetch() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -q ${insecure_downloads:+--insecure} --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
+      --connect-timeout 20 --max-time 300 --output "$2" "$1" >>"$log" 2>&1 || fail "Download failed: $1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget ${insecure_downloads:+--no-check-certificate} --https-only --timeout=30 --tries=2 -q -O "$2" "$1" >>"$log" 2>&1 || fail "Download failed: $1"
+  else
+    fail 'Install curl or wget, or place slib.sh beside the installer for --swap-only'
+  fi
+}
+
+# run(message, command...) Preserves the command's failure and keeps detailed output.
+run() {
+  local message="$1" command_text='' arg
+  shift
+  # run_ok accepts shell text; quote each argument before passing it through.
+  for arg do
+    arg=$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")
+    command_text="$command_text '$arg'"
+  done
+  # slib's command log path must have no spaces; merge it into the main log.
+  local RUN_LOG result
+  RUN_LOG=$(mktemp "$CLOUDMIN_INSTALL_TEMPDIR/command.XXXXXX") || fail 'Cannot create command log'
+  run_ok "$command_text" "$message"
+  result=$?
+  cat "$RUN_LOG" >>"$log"
+  rm -f "$RUN_LOG"
+  [ "$result" -eq 0 ] || fail "$message failed; see $log"
+}
+
+# load_slib() Loads logging, prompts, progress and swap helpers.
+load_slib() {
+  if [ -f "$script_dir/slib.sh" ]; then
+    library="$script_dir/slib.sh"
+  else
+    library="$CLOUDMIN_INSTALL_TEMPDIR/slib.sh"
+    fetch "https://$download_cloudmin_host_lib/slib.sh" "$library"
+  fi
+  # The shared logger initializes terminal colors even for unattended runs.
+  TERM=${TERM:-dumb}; export TERM
+  # slib writes terminal probes and spinner state in the current directory.
+  cd "$CLOUDMIN_INSTALL_TEMPDIR" || fail 'Cannot enter temporary directory'
+  . "$library"
+  LOG_PATH=$log; RUN_LOG=$log; LOG_LEVEL_LOG=DEBUG
+  RUN_ERRORS_FATAL=
+  SPINNER_DONEFILE="$CLOUDMIN_INSTALL_TEMPDIR/stopspinning"
+  LOG_LEVEL_STDOUT=INFO
+  [ "$VERBOSE" != 1 ] || LOG_LEVEL_STDOUT=DEBUG
+  # The shared library has terminal cleanup traps; own our task directory here.
+  trap finish EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
+  trap 'exit 131' QUIT
+  if [ -z "$noswap$setup$uninstall_mode" ] && [ "${SLIB_SWAP_API:-0}" != 2 ]; then
+    fail 'The loaded utility library does not support swap management. Update slib.sh.'
+  fi
+}
+
+# swap_abort() Is called by the shared library if its safety checks fail.
+swap_abort() {
+  if [ -z "$swap_only" ]; then
+    log_error "Re-run the installer with --no-swap${swapsize:+ instead of --swap} to skip swap setup."
+  fi
+  exit 1
+}
+
+# confirm(prompt) Uses the shared yes/no prompt and restores terminal echo.
+confirm() {
+  [ "$skipyesno" = 1 ] && return 0
+  [ -t 0 ] || fail 'Use --yes for unattended installation'
+  printf '%s' "$1"
+  yesno
+  local result=$?
+  stty echo 2>/dev/null || :
+  return "$result"
+}
+
+# repositories() Uses the current shared Webmin repository bootstrap and group IDs.
+repositories() {
+  if [ "$manager" = apt-get ]; then
+    run 'Refreshing distribution metadata' apt-get update
+    run 'Installing repository prerequisites' apt-get -y install ca-certificates curl gnupg
+    if [ "$ID" = ubuntu ]; then
+      run 'Installing repository tools' apt-get -y install software-properties-common
+      run 'Enabling Ubuntu universe' add-apt-repository -y universe
+    fi
+  else
+    # Existing curl-minimal is sufficient; do not force replacement with curl.
+    if ! command -v curl >/dev/null 2>&1; then
+      run 'Installing the repository HTTP client' dnf -y install curl
+    fi
+    run 'Installing repository prerequisites' dnf -y install ca-certificates dnf-plugins-core
+    run 'Enabling CRB' dnf config-manager --set-enabled crb
+    run 'Installing EPEL configuration' dnf -y install epel-release
+  fi
+  bootstrap="$CLOUDMIN_INSTALL_TEMPDIR/setup-repo.sh"
+  fetch 'https://raw.githubusercontent.com/webmin/webmin/master/webmin-setup-repo.sh' "$bootstrap"
+  run 'Configuring Webmin repository' sh "$bootstrap" --force "--$branch" \
+    "--host=$download_webmin_host" "--unstable-host=$download_webmin_host_dev"
+  # Stable Webmin supplies the signing key; Cloudmin uses its own repository name.
+  run 'Configuring Cloudmin repository' sh "$bootstrap" --force "--$branch" \
+    --name=cloudmin --dist=cloudmin --description=Cloudmin --component=main \
+    "--host=$download_cloudmin_host" "--unstable-host=$download_cloudmin_host_dev" \
+    "--key-server=https://$download_webmin_host" \
+    --check-binary=0 --install-packages=cloudmin-config
+  if [ "$manager" = apt-get ]; then
+    run 'Refreshing package metadata' apt-get update
+  else
+    run 'Refreshing package metadata' dnf -y makecache --refresh
+  fi
+}
+
+# configure() Passes validated plugin lists as arguments, without evaluating shell text.
+configure() {
+  set -- --bundle KVM --log "$log"
+  if [ -n "$includes" ]; then
+    set -- "$@" --include
+    for plugin in $(printf '%s' "$includes" | tr ',' ' '); do set -- "$@" "$plugin"; done
+  fi
+  if [ -n "$excludes" ]; then
+    set -- "$@" --exclude
+    for plugin in $(printf '%s' "$excludes" | tr ',' ' '); do set -- "$@" "$plugin"; done
+  fi
+  log_info 'Checking KVM appliance boot (3-minute timeout)'
+  # Show the failed check and its advice as well as retaining the complete log.
+  if ! cloudmin-config-system "$@"; then
+    tail -n 30 "$log" >&2
+    fail "Cloudmin configuration or readiness failed; see $log"
+  fi
+}
+
+phase() {
+    phases_total="${phases_total:-4}"
+    phase_description="$1"
+    phase_number="$2"
+    # Print completed phases (green)
+    printf "${GREEN}"
+    for i in $(seq 1 $(( phase_number - 1 ))); do
+        printf "▣"
+    done
+    # Print current phase (yellow)
+    printf "${YELLOW}▣"
+    # Print remaining phases (cyan)
+    for i in $(seq $(( phase_number + 1 )) "$phases_total"); do
+        printf "${CYAN}◻"
+    done
+    log_debug "Phase ${phase_number} of ${phases_total}: ${phase_description}"
+    printf "${NORMAL} Phase ${YELLOW}${phase_number}${NORMAL} of ${GREEN}${phases_total}${NORMAL}: ${phase_description}\\n"
+}
+
+# install_logo() displays an inline logo and leaves room for the welcome text.
+# Return 1 without output when the text banner should be used alone.
+install_logo() (
+  # Keep images out of logs, unattended runs, and plain-output sessions.
+  [ -t 1 ] && [ "${INTERACTIVE_MODE:-}" != off ] &&
+    [ "${NONINTERACTIVE:-0}" != 1 ] && [ -z "${NO_COLOR:-}" ] || return 1
+  [ -z "${TMUX:-}${STY:-}${ZELLIJ:-}" ] || return 1
+  case "${TERM:-}:${OLDTERM:-}" in
+    :*|dumb:*|linux:*|screen*|tmux*|*:screen*|*:tmux*) return 1 ;;
+  esac
+
+  # slib may replace TERM when the server lacks the client's terminfo entry.
+  # Use known protocols without probing or consuming answers to later prompts.
+  case "${TERM_PROGRAM:-}:${OLDTERM:-${TERM:-}}" in
+    kitty:*|ghostty:*|*:xterm-kitty|*:xterm-ghostty) logo_protocol=kitty ;;
+    iTerm.app:*) logo_protocol=iterm ;;
+    *) return 1 ;;
+  esac
+
+  # Reserve two columns for a round, line-height icon and one for the gap.
+  # Preserve stdout's terminal, even when it is open only for writing.
+  # stty queries the device through fd 0 without reading input bytes.
+  { logo_size=$(stty size 0>&3 2>/dev/null); } 3>&1 || return 1
+  logo_rows=${logo_size% *}
+  logo_cols=${logo_size#* }
+  case "$logo_cols:$logo_rows" in
+    *[!0-9:]*|:*|*:) return 1 ;;
+  esac
+  logo_heading="     Welcome to the Cloudmin GPL installer, version $VER"
+  [ "$logo_cols" -ge "${#logo_heading}" ] && [ "$logo_rows" -ge 16 ] || return 1
+
+  # Reserve a row for iTerm2's cursor movement, then draw at the text margin.
+  printf '\n\033[1A\033[3G\0337'
+  # Transparent 64x64 PNG from authentic-theme-src/.art/Logos/svgs/cloudmin.svg,
+  # rendered in Cloudmin orange and embedded to avoid a download.
+  awk -v protocol="$logo_protocol" '
+    { data = data $0 }
+    END {
+      if (protocol == "kitty") {
+        # Set one row of height and let the width follow the image proportions.
+        # The PNG fits in one 4096-byte chunk. Suppress replies and leave the
+        # cursor in place for the welcome text.
+        printf "\033_Ga=T,f=100,r=1,C=1,q=2;%s\033\\", data
+      } else {
+        # Use the same line-height sizing and proportions in iTerm2.
+        printf "\033]1337;File=inline=1;width=auto;height=1;preserveAspectRatio=1:%s\007", data
+      }
+    }
+  ' <<'CLOUDMIN_LOGO_PNG'
+iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAAElBMVEX////mfjjmfjfmfjnmfzjl
+fjjCGAUrAAAAAXRSTlMAQObYZgAAAQRJREFUWMPtltsSwyAIRKFL//+X2ziTRAUR4lM7bjs+GPYE
+vIZo6y/FlfLuF/dK2cGGoHPE9zfJfZiFkxu7Qvl75VkPeCIx/Zm8dJwesSrxY+xYyqsFdq5CWkZl
+d3cXY0+uVxyaEPH9B0BKWxrcUF2/enZ28A1gFWTljAggPPsTQGhFWwBpAUgD0AJ4DuCrrUjnHHJO
+eghyfqwCaBFAiwB6CBAR6yiJzsJ4t4VSsLZrfCENAN1Spqzf3Y0U8esDrTEEANaJVF1emPppEjEH
+uKe6mib3Hd6dS/SMgBBgeGtfvSAKEy7GG25tHiG4BOOEiD/4ieMLa/ZDi595qpK8e2tr63f1ARDU
+BfC/l29+AAAAAElFTkSuQmCC
+CLOUDMIN_LOGO_PNG
+  # Start the welcome text on the same row, one space after the icon.
+  printf '\0338\033[3C'
+)
+
+install_msg() {
+  supported="    ${CYANBG}${BLACK}${BOLD}Enterprise Linux and derivatives${NORMAL}${CYAN}
+      - AlmaLinux and Rocky Linux 10 on x86_64 and aarch64${NORMAL}
+    ${CYANBG}${BLACK}${BOLD}Debian Linux and derivatives${NORMAL}${CYAN}
+      - Debian 13 on amd64 and arm64
+      - Ubuntu 26.04 LTS on amd64 and arm64${NORMAL}"
+
+  # Display the logo when the terminal supports inline images.
+  printf '\n  '
+  bind_hook install_logo || :
+  cat <<EOF
+Welcome to the ${ORANGE}${BOLD}Cloudmin GPL${NORMAL} installer, version ${ORANGE}${BOLD}$VER${NORMAL}
+
+  This script must be run on a freshly installed supported OS. It does not
+  perform updates or upgrades (use your system package manager) or license
+  changes (use System Settings / License Manager in Cloudmin).
+
+EOF
+  cat <<EOF
+  The systems currently supported by the install script are:
+
+EOF
+  echo "$supported"
+  # Include the optional swap plan in the installation summary below.
+  swap_note=""
+  if [ "${SLIB_SWAP_API:-0}" = 2 ] && [ -z "$setup$noswap" ] &&
+     swap_plan "$disk_space_required"; then
+    swap_note=$(swap_plan_message)
+  fi
+  cat <<EOF
+  If your OS/version/arch is not listed, installation ${BOLD}${RED}will fail${NORMAL}. More
+  details about the systems supported by the script can be found here:
+
+    ${UNDERLINE}https://www.cloudmin.com/docs/os-support/${NORMAL}
+
+EOF
+  # Wrap the complete paragraph to match the surrounding text. Count plain
+  # characters before adding color, keeping each size and its unit together.
+  # The first input line contains the disk estimate; later sizes describe swap.
+  printf '%s\n' \
+    "The installation will require up to $disk_space_required GiB of disk space." \
+    "${swap_note:+$swap_note }The selected" \
+    "package bundle is $bundle. More details" \
+    "about installation can be found here:" |
+    awk -v cyan="$CYAN" -v yellow="$YELLOW" -v normal="$NORMAL" \
+        -v bundle="$bundle" '
+      {
+        for (i = 1; i <= NF; i++) {
+          word = $i
+          display = word
+          if (word ~ /^[0-9]+$/ && i < NF && $(i + 1) ~ /^[GM]iB[.]?$/) {
+            unit = $(++i)
+            suffix = (unit ~ /[.]$/ ? "." : "")
+            sub(/[.]$/, "", unit)
+            word = word " " unit
+            display = (NR == 1 ? cyan : yellow) word normal suffix
+            word = word suffix
+          } else if (word == bundle ".") {
+            display = cyan bundle normal "."
+          }
+          if (column && column + 1 + length(word) > 70) {
+            printf "\n"
+            column = 0
+          }
+          printf "%s%s", (column ? " " : "  "), display
+          column += (column ? 1 : 0) + length(word)
+        }
+      }
+      END { printf "\n" }
+    '
+  cat <<EOF
+
+    ${UNDERLINE}https://www.cloudmin.com/docs/installation/automated/${NORMAL}
+
+EOF
+
+  if [ "$skipyesno" -ne 1 ]; then
+  cat <<EOF
+  Exit and re-run this script with ${CYAN}--help${NORMAL} flag to see available options.
+
+EOF
+  fi
+  if [ "$skipyesno" -ne 1 ]; then
+    if ! confirm " Continue? (y/n) "; then
+      exit
+    fi
+  fi
+}
+
+unstable_repos_system_msg() {
+  # Development builds skip the unstable warning and its extra confirmation.
+  if [ "${CLOUDMIN_DEVELOPMENT:-0}" != 1 ] && [ "$branch" = "unstable" ]; then
+    cat <<EOF
+
+  ${REDBG}${WHITE}${BOLD} DANGER ${NORMAL}
+
+  You have enabled the unstable development branch, where packages are built
+  automatically with every commit to the repositories of each product we
+  offer. This branch is strictly for testing and development purposes
+  and must not be used in a production environment!
+
+EOF
+
+    if [ "$skipyesno" -ne 1 ]; then
+      if ! confirm " Continue with $branch branch? (y/n) "; then
+        exit
+      fi
+    fi
+  fi
+}
+
+preconfigured_system_msg() {
+  # Double check if installed, just in case above error ignored.
+  is_preconfigured_rs=$(is_preconfigured)
+  if [ -n "$is_preconfigured_rs" ]; then
+    cat <<EOF
+
+  ${WHITEBG}${RED}${BOLD} ATTENTION ${NORMAL}
+
+  Pre-installed software detected: $is_preconfigured_rs
+
+  It is highly advised ${BOLD}${RED}not to pre-install${NORMAL} any additional packages on your
+  OS. The installer expects a freshly installed OS, and anything you do
+  differently might cause conflicts or configuration errors. If you need
+  to enable third-party package repositories, do so after installation
+  of Cloudmin, and only with extreme caution.
+
+EOF
+    if [ "$skipyesno" -ne 1 ]; then
+      if ! confirm " Continue? (y/n) "; then
+        exit
+      fi
+    fi
+  fi
+}
+
+is_preconfigured() {
+  preconfigured=""
+  if named -v 1>/dev/null 2>&1; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}BIND${NORMAL} "
+  fi
+  if apachectl -v 1>/dev/null 2>&1; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}Apache${NORMAL} "
+  fi
+  if nginx -v 1>/dev/null 2>&1; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}Nginx${NORMAL} "
+  fi
+  if command -pv mariadb 1>/dev/null 2>&1; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}MariaDB${NORMAL} "
+  fi
+  if postconf mail_version 1>/dev/null 2>&1; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}Postfix${NORMAL} "
+  fi
+  if php -v 1>/dev/null 2>&1; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}PHP${NORMAL} "
+  fi
+  preconfigured=$(echo "$preconfigured" | sed 's/ /, /g' | sed 's/, $/ /')
+  echo "$preconfigured"
+}
+
+# is_installed() Detects an existing Cloudmin installation.
+is_installed() {
+  [ -f /etc/webmin/server-manager/config ]
+}
+
+already_installed_block() {
+  log_error "Your system already has a successful Cloudmin installation deployed."
+  log_error "Re-installation is neither possible nor necessary. This script must be"
+  log_error "run on a freshly installed supported operating system. It is not meant"
+  log_error "for package updates or license changes. For further assistance, please"
+  log_error "visit the Cloudmin Community forum."
+  exit 100
+}
+
+# already_installed_msg() Warns before an explicitly requested reinstall.
+already_installed_msg() {
+  if is_installed; then
+    cat <<EOF
+
+  ${WHITEBG}${RED}${BOLD} WARNING ${NORMAL}
+
+  If Cloudmin is already installed successfully, ${BOLD}${RED}do not${NORMAL} run this
+  script again to fix problems, upgrade, or change the license!
+
+  Updates and upgrades must be performed from within Cloudmin or by
+  using your system package manager on the command line.
+  Change licenses in System Settings / License Manager.
+
+EOF
+    confirm ' Continue? (y/n) ' || exit 0
+  fi
+}
+
+# install_cloudmin() Installs the KVM stack and checks configuration API versions.
+install_cloudmin() {
+  [ -n "$no_updates" ] || run 'Checking and installing system package updates' "$manager" -y upgrade
+  [ -z "$hostname_arg" ] || run 'Setting the host name' hostnamectl set-hostname "$hostname_arg"
+  # One transaction installs both the core and the architecture's KVM runtime.
+  if [ "$manager" = apt-get ]; then
+    set -- -y --no-install-recommends install cloudmin-core cloudmin-kvm-stack
+  else
+    set -- -y --setopt=strict=1 --setopt=install_weak_deps=False \
+      --setopt=optional_metadata_types=filelists install @cloudmincore @cloudmin-kvm \
+      'cloudmin-config >= 10.0.0' 'webmin >= 2.670'
+  fi
+  for package in $(printf '%s' "$extra" | tr ',' ' '); do set -- "$@" "$package"; done
+  run 'Installing Cloudmin and the KVM stack' "$manager" "$@"
+  if [ "$manager" = apt-get ]; then
+    config_version=$(dpkg-query -W -f='${Version}' cloudmin-config) || fail 'cloudmin-config is missing'
+    webmin_version=$(dpkg-query -W -f='${Version}' webmin) || fail 'Webmin is missing'
+    run 'Checking the configuration package version' dpkg --compare-versions "$config_version" ge 10.0.0
+    run 'Checking the Webmin version' dpkg --compare-versions "$webmin_version" ge 2.670
+  else
+    run 'Checking the configuration package version' rpm -q --whatprovides 'cloudmin-config >= 10.0.0'
+    run 'Checking the Webmin version' rpm -q --whatprovides 'webmin >= 2.670'
+  fi
+}
+
+# post_install_message() Shows the login URL after installation succeeds.
+post_install_message() {
+  log_success "Installation Complete!"
+  log_success "Cloudmin is ready at https://${hostname_arg:-$(hostname -f)}:10000."
+  log_warning "You will see a security warning in the browser on your first visit."
+}
+
+# load_module() Loads a local module before configuration starts.
+load_module() {
+  [ -n "$module_name" ] || return 0
+  bind_hook modules_pre || return $?
+  . "$script_dir/$module_name.sh" || return $?
+  bind_hook modules_post
+}
+
+# extra_phases() Runs tab-separated number, name, command and description rows.
+extra_phases() {
+  [ -n "$hooks__phases" ] || return 0
+  bind_hook phases_pre || return $?
+  printf '%s\n' "$hooks__phases" > "$CLOUDMIN_INSTALL_TEMPDIR/phases"
+  local number name command_text description previous=''
+  while IFS="$(printf '\t')" read -r number name command_text description; do
+    [ -n "$number" ] || continue
+    if [ "$number" != "$previous" ]; then
+      printf '\n'
+      bind_hook phase "$name" "$number" || return $?
+      previous=$number
+    fi
+    run "$description" eval "$command_text" || return $?
+  done < "$CLOUDMIN_INSTALL_TEMPDIR/phases"
+  bind_hook phases_post
+}
+
+# uninstall() Removes Cloudmin packages without deleting virtual machine data.
+uninstall() {
+  if [ "$skipyesno" -ne 1 ]; then
+    cat <<EOF
+
+  ${REDBG}${BLACK}${BOLD} WARNING ${NORMAL}
+
+  This operation removes Cloudmin packages and repository configuration.
+  Virtual machine disks and the shared Webmin installation are kept.
+  It must never be executed on a live production system!
+
+EOF
+    confirm " ${RED}Uninstall?${NORMAL} (y/N) " || return 0
+  fi
+  phases_total=1
+  bind_hook phase Uninstall 1 || return $?
+  if [ "$manager" = apt-get ]; then
+    run 'Uninstalling Cloudmin packages' apt-get -y remove cloudmin-core cloudmin-kvm-stack cloudmin-config webmin-server-manager
+  else
+    run 'Uninstalling Cloudmin packages' dnf -y --setopt=clean_requirements_on_remove=False remove cloudmin-config webmin-server-manager
+  fi
+  for repo in cloudmin cloudmin-stable cloudmin-unstable; do
+    rm -f "/etc/apt/sources.list.d/$repo.list" "/etc/apt/sources.list.d/$repo.sources" \
+      "/etc/apt/auth.conf.d/$repo.conf" "/etc/yum.repos.d/$repo.repo" || return $?
+  done
+  log_success 'Cloudmin uninstallation complete.'
 }
 
 test_connection() {
@@ -175,1713 +822,123 @@ test_connection() {
   fi
 }
 
-# Default function to parse arguments
-parse_args() {
-  while [ "$1" != "" ]; do
-    case $1 in
-    --help | -h)
-      bind_hook "usage"
-      exit 0
-      ;;
-    --bundle | -b)
-      shift
-      case "$1" in
-      KVM)
-        shift
-        bundle='KVM'
-        ;;
-      *)
-        printf "Unknown bundle: $1\\n"
-        bind_hook "usage"
-        exit 1
-        ;;
-      esac
-      ;;
-    --branch | -B)
-      shift
-      case "$1" in
-      unstable|testing|development|devel|dev|nightly|bleeding-edge|cutting-edge)
-        shift
-        branch='unstable'
-        ;;
-      prerelease|pre-release|rc|release-candidate)
-        shift
-        branch='prerelease'
-        ;;
-      stable|production|release)
-        shift
-        branch=''
-        ;;
-      *)
-        printf "Unknown branch: $1\\n"
-        bind_hook "usage"
-        exit 1
-        ;;
-      esac
-      ;;
-    --insecure-downloads | -i)
-      shift
-      insecure_download_wget_flag=' --no-check-certificate'
-      insecure_download_curl_flag=' -k'
-      ;;
-    --no-package-updates | -x)
-      shift
-      noupdates=1
-      ;;
-    --setup | -s)
-      shift
-      setup_only=1
-      mode='setup'
-      unstable='unstable'
-      log_file_name="${setup_log_file_name:-cloudmin-repos-setup}"
-      ;;
-    --connect | -C)
-      shift
-      if [ -z "$1" ] || [ "${1#-}" != "$1" ]; then
-        test_connection_type="ipv4 ipv6"
-      else
-        if [ "$1" != "ipv4" ] && [ "$1" != "ipv6" ]; then
-          printf "Invalid protocol: $1\\n"
-          bind_hook "usage"
-          exit 1
-        fi
-        test_connection_type="$1"
-        shift
-      fi
-      ;;
-    --os-grade | -g)
-      shift
-      case "$1" in
-      A|a)
-        shift
-        ;;
-      B|b)
-        shift
-        unstable='unstable'
-        cloudmin_config_system_excludes=""
-        cloudmin_stack_custom_packages=""
-        ;;
-      *)
-        printf "Unknown OS grade: $1\\n"
-        bind_hook "usage"
-        exit 1
-        ;;
-      esac
-      ;;
-    --module | -o)
-      shift
-      module_name=$1
-      shift
-      ;;
-    --hostname | -n)
-      shift
-      forcehostname=$1
-      shift
-      ;;
-    --force | -f | --yes | -y)
-      shift
-      skipyesno=1
-      ;;
-    --force-reinstall | -fr)
-      shift
-      forcereinstall=1
-      ;;
-    --no-banner | -nb)
-      shift
-      skipbanner=1
-      ;;
-    --verbose | -v)
-      shift
-      VERBOSE=1
-      ;;
-    --version | -V)
-      shift
-      showversion=1
-      ;;
-    --uninstall | -u)
-      shift
-      mode="uninstall"
-      log_file_name="${uninstall_log_file_name:-cloudmin-uninstall}"
-      ;;
-    *)
-      printf "Unrecognized option: $1\\n"
-      bind_hook "usage"
-      exit 1
-      ;;
-    esac
+# check_connections() Tests repository connectivity without installing anything.
+check_connections() {
+  local host protocol result=0
+  for host in "$download_webmin_host_dev" "$download_cloudmin_host_dev"; do
+    for protocol in $connect; do test_connection "$host" "$protocol" || result=1; done
   done
+  return "$result"
 }
 
-# Hook arguments
-bind_hook "parse_args" "$@"
-
-# Default function to show installer version
-show_version() {
-  echo "$VER"
-  exit 0
-}
-
-# Hook version
-if [ -n "$showversion" ]; then
-  bind_hook "show_version"
-fi
-
-# Update variables based on branch
-if [ "$branch" = 'unstable' ]; then
-  download_cloudmin_host_lib="$download_cloudmin_host_dev"
-elif [ "$branch" = 'prerelease' ]; then
-  download_cloudmin_host_lib="$download_cloudmin_host_rc"
-fi
-
-# If connectivity test is requested
-if [ -n "$test_connection_type" ]; then
-  for test_type in $test_connection_type; do
-    test_connection "$download_cloudmin_host" "$test_type"
-    if [ "$branch" = 'unstable' ]; then
-      test_connection "$download_webmin_host_dev" "$test_type"
-      test_connection "$download_cloudmin_host_dev" "$test_type"
-    elif [ "$branch" = 'prerelease' ]; then
-      test_connection "$download_webmin_host_rc" "$test_type"
-      test_connection "$download_cloudmin_host_rc" "$test_type"
-    fi
-  done
-  exit 0
-fi
-
-# Force setup mode, if script name is `setup-repos.sh` as it
-# is used by Cloudmin API, to make sure users won't run an
-# actual install script under any circumstances
-if [ "$script_name" = "setup-repos.sh" ]; then
-  setup_only=1
-  mode='setup'
-  unstable='unstable'
-fi
-
-# Store new log each time
-log="$pwd/$log_file_name.log"
-if [ -e "$log" ]; then
-  while true; do
-    logcnt=$((logcnt+1))
-    logold="$log.$logcnt"
-    if [ ! -e "$logold" ]; then
-      mv "$log" "$logold"
-      break
-    fi
-  done
-fi
-
-# If Pro user downloads GPL version of `install.sh` script
-# to fix repos check if there is an active license exists
-if [ -n "$setup_only" ]; then
-  if [ "$SERIAL" = "GPL" ] && [ "$KEY" = "GPL" ] && [ -f "$cloudmin_license_file" ]; then
-    cloudmin_license_existing_serial="$(grep 'SerialNumber=' "$cloudmin_license_file" | sed 's/SerialNumber=//')"
-    cloudmin_license_existing_key="$(grep 'LicenseKey=' "$cloudmin_license_file" | sed 's/LicenseKey=//')"
-    if [ -n "$cloudmin_license_existing_serial" ] && [ -n "$cloudmin_license_existing_key" ]; then
-      SERIAL="$cloudmin_license_existing_serial"
-      KEY="$cloudmin_license_existing_key"
-    fi    
+# main(args...) Runs installation or the requested standalone operation.
+main() {
+  bind_hook parse_args "$@" || fail 'Cannot parse installation options'
+  [ -z "$showversion" ] || { bind_hook show_version; return $?; }
+  if [ "${CLOUDMIN_SETUP_ONLY:-0}" = 1 ]; then
+    setup=1; swap_only=; noswap=1; swapsize=; uninstall_mode=; connect=
   fi
-fi
-
-if [ "$SERIAL" = "GPL" ]; then
-  LOGIN=""
-  PRODUCT="GPL"
-  repopath="gpl/"
-  packagetype="gpl"
-else
-  LOGIN="$SERIAL:$KEY@"
-  PRODUCT="Professional"
-  packagetype="pro"
-  repopath="pro/"
-fi
-
-# Cloudmin-provided packages
-vmgroup="'Cloudmin Core'"
-vmgrouptext="Cloudmin $cm_version provided packages"
-debvmpackages="cloudmin-core"
-deps=
-
-if [ "$bundle" = 'KVM' ]; then
-  rhgroup="'Cloudmin KVM Stack'"
-  rhgrouptext="Cloudmin $cm_version KVM stack"
-  debdeps="cloudmin-kvm-stack"
-  ubudeps="cloudmin-kvm-stack"
-fi
-
-# Find temp directory
-if [ -z "$TMPDIR" ]; then
-  TMPDIR=/tmp
-fi
-
-# Check whether $TMPDIR is mounted noexec (everything will fail, if so)
-TMPNOEXEC="$(grep "$TMPDIR" /etc/mtab | grep noexec)"
-if [ -n "$TMPNOEXEC" ]; then
-  echo "Error: $TMPDIR directory is mounted noexec. Cannot continue."
-  exit 1
-fi
-
-if [ -z "$CLOUDMIN_INSTALL_TEMPDIR" ]; then
-  CLOUDMIN_INSTALL_TEMPDIR="$TMPDIR/.cloudmin-$$"
-  if [ -e "$CLOUDMIN_INSTALL_TEMPDIR" ]; then
-    rm -rf "$CLOUDMIN_INSTALL_TEMPDIR"
+  [ -z "$connect" ] || { bind_hook check_connections; return $?; }
+  [ -z "$swap_only" ] || [ -z "$noswap" ] || { printf 'System swap left unchanged.\n'; return 0; }
+  bind_hook preflight || fail 'System checks failed'
+  script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || fail 'Cannot find installer directory'
+  [ -z "$module_name" ] || [ -f "$script_dir/$module_name.sh" ] || fail "Module not found: $module_name.sh"
+  umask 077
+  mkdir -p -- "$log_dir" || fail 'Cannot create the log directory'
+  log="$log_dir/cloudmin-install.log"
+  [ -z "$setup" ] || log="$log_dir/cloudmin-repos-setup.log"
+  [ -z "$uninstall_mode" ] || log="$log_dir/cloudmin-uninstall.log"
+  [ -z "$swap_only" ] || log="$log_dir/cloudmin-swap.log"
+  # Preserve logs from previous runs.
+  if [ -e "$log" ]; then
+    logcnt=1
+    while [ -e "$log.$logcnt" ]; do logcnt=$((logcnt+1)); done
+    mv "$log" "$log.$logcnt" || fail 'Cannot rotate the log file'
   fi
-  mkdir "$CLOUDMIN_INSTALL_TEMPDIR"
-fi
-
-# Export temp directory for Cloudmin Config
-export CLOUDMIN_INSTALL_TEMPDIR
-
-# "files" subdir for libs
-mkdir "$CLOUDMIN_INSTALL_TEMPDIR/files"
-srcdir="$CLOUDMIN_INSTALL_TEMPDIR/files"
-
-# Switch to temp directory or exit with error
-goto_tmpdir() {
-  if ! cd "$srcdir" >>"$log" 2>&1; then
-    echo "Error: Failed to enter $srcdir temporary directory"
-    exit 1
-  fi
-}
-goto_tmpdir
-
-pre_check_http_client() {
-  # Check for wget or curl or fetch
-  printf "Checking for HTTP client .." >>"$log"
-  while true; do
-    if [ -x "/usr/bin/wget" ]; then
-      download="/usr/bin/wget -nv$insecure_download_wget_flag"
-      break
-    elif [ -x "/usr/bin/curl" ]; then
-      download="/usr/bin/curl -f$insecure_download_curl_flag -s -L -O"
-      break
-    elif [ -x "/usr/bin/fetch" ]; then
-      download="/usr/bin/fetch"
-      break
-    elif [ "$wget_attempted" = 1 ]; then
-      printf " error: No HTTP client available. The installation of a download command has failed. Cannot continue.\\n" >>"$log"
-      return 1
-    fi
-
-    # Made it here without finding a downloader, so try to install one
-    wget_attempted=1
-    if [ -x /usr/bin/dnf ]; then
-      dnf -y install wget >>"$log"
-    elif [ -x /usr/bin/yum ]; then
-      yum -y install wget >>"$log"
-    elif [ -x /usr/bin/apt-get ]; then
-      apt-get update >>/dev/null
-      apt-get -y -q install wget >>"$log"
-    fi
-  done
-  if [ -z "$download" ]; then
-    printf " not found\\n" >>"$log"
-    return 1
-  else
-    printf " found %s\\n" "$download" >>"$log"
-    return 0;
-  fi
-}
-
-download_slib() {
-  # If slib.sh is available locally in the same directory use it
-  if [ -f "$pwd/slib.sh" ]; then
-    chmod +x "$pwd/slib.sh"
-    # shellcheck disable=SC1091
-    . "$pwd/slib.sh"
-  # Download the slib (source: http://github.com/virtualmin/slib)
-  else
-    # We need HTTP client first
-    pre_check_http_client
-    $download "https://$download_cloudmin_host_lib/slib.sh" >>"$log" 2>&1
-    if [ $? -ne 0 ]; then
-      echo "Error: Failed to download utility function library. Cannot continue. Check your network connection and DNS settings, and verify that your system's time is accurately synchronized."
-      exit 1
-    fi
-    chmod +x slib.sh
-    # shellcheck disable=SC1091
-    . ./slib.sh
-  fi
-}
-
-# Check if already installed successfully
-already_installed_block() {
-  log_error "Your system already has a successful Cloudmin installation deployed."
-  log_error "Re-installation is neither possible nor necessary. This script must be"
-  log_error "run on a freshly installed supported operating system. It does not fit"
-  log_error "for package updates or license changes. For further assistance, please"
-  log_error "visit the Virtualmin Community forum."
-  exit 100
-}
-
-# Utility function library
-##########################################
-download_slib # for production this block
-              # can be replaces with the
-              # content of slib.sh file,
-              # minus its header
-##########################################
-
-# Get OS type
-get_distro
-
-# Check the serial number and key
-serial_ok "$SERIAL" "$KEY"
-# Setup slog
-LOG_PATH="$log"
-# Setup run_ok
-RUN_LOG="$log"
-# Exit on any failure during shell stage
-RUN_ERRORS_FATAL=1
-
-# Console output level; ignore debug level messages.
-if [ "$VERBOSE" = "1" ]; then
-  LOG_LEVEL_STDOUT="DEBUG"
-else
-  LOG_LEVEL_STDOUT="INFO"
-fi
-# Log file output level; catch literally everything.
-LOG_LEVEL_LOG="DEBUG"
-
-# If already installed successfully, do not allow running again
-if [ -f "/etc/webmin/server-manager/installed-auto" ] && 
-   [ -z "$setup_only" ] && [ -z "$forcereinstall" ] &&
-   [ "$mode" != "uninstall" ]; then
-  bind_hook "already_installed_block"
-fi
-if [ -n "$setup_only" ]; then
-  log_info "Setup log is written to $LOG_PATH"
-elif [ "$mode" = "uninstall" ]; then
-  log_info "Uninstallation log is written to $LOG_PATH"
-else
-  log_info "Installation log is written to $LOG_PATH"
-fi
-log_debug "LOG_ERRORS_FATAL=$RUN_ERRORS_FATAL"
-log_debug "LOG_LEVEL_STDOUT=$LOG_LEVEL_STDOUT"
-log_debug "LOG_LEVEL_LOG=$LOG_LEVEL_LOG"
-
-# log_fatal calls log_error
-log_fatal() {
-  log_error "$1"
-}
-
-# Handle unstable or prerelease repositories
-handle_branches() {
-  del_cmd="" found_type="" reinstalling=0
-  found_both=0 found_unstable=0 found_prerelease=0
-
-  # Set paths based on package type
-  case "$package_type" in
-    deb)
-      repo_dir="/etc/apt/sources.list.d"
-      auth_dir="/etc/apt/auth.conf.d"
-      repo_ext="list"
-      ;;
-    rpm)
-      repo_dir="/etc/yum.repos.d"
-      repo_ext="repo"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-
-  # Remove existing unstable or prerelease repos if found
-  for repo in cloudmin-unstable cloudmin-prerelease webmin-unstable \
-              webmin-prerelease webmin-testing webmin-nightly; do
-    repo_file="${repo_dir}/${repo}.${repo_ext}"
-    if [ -f "$repo_file" ]; then
-      del_cmd="${del_cmd:+$del_cmd && }rm -f $repo_file"
-      case "$repo" in
-        *unstable* | *testing* | *nightly*)
-          found_unstable=1
-          found_type="unstable"
-          ;;
-        *prerelease*)
-          found_prerelease=1
-          found_type="prerelease"
-          ;;
-      esac
-    fi
-
-    # Auth file check for deb
-    if [ "$package_type" = "deb" ]; then
-      case "$repo" in
-        cloudmin-*) 
-          auth_file="${auth_dir}/${repo}.conf"
-          [ -f "$auth_file" ] && del_cmd="${del_cmd:+$del_cmd && }rm -f $auth_file"
-          ;;
-      esac
-    fi
-  done
-
-  # Execute removal if exists
-  if [ -n "$del_cmd" ]; then
-    if [ "$found_unstable" -eq 1 ] && [ "$found_prerelease" -eq 1 ]; then
-      msg="Uninstalling Cloudmin $cm_version unstable and prerelease repositories"
-      found_both=1
-    elif [ "$found_unstable" -eq 1 ]; then
-      msg="Uninstalling Cloudmin $cm_version unstable repository"
-    else
-      msg="Uninstalling Cloudmin $cm_version prerelease repository"
-    fi
-
-    # If removing only, update metadata
-    if [ -z "$branch" ]; then
-      del_cmd="$del_cmd && $update"
-    fi
-
-    # Remove silently if reinstalling
-    if [ -n "$branch" ] && [ "$found_both" -eq 0 ] && [ "$found_type" = "$branch" ]; then
-      eval "$del_cmd"
-      reinstalling=1
-    else
-      run_ok "$del_cmd" "$msg"
-    fi
-  fi
-
-  # Setup new branch if requested
-  if [ -n "$branch" ]; then
-    if [ "$reinstalling" -eq 1 ]; then
-      install_pre_msg="Reinstalling Cloudmin $cm_version"
-    else
-      install_pre_msg="Installing Cloudmin $cm_version"
-    fi
-    down_cmd="$download https://$download_cloudmin_host_dev/install"
-    case "$branch" in
-      unstable)
-        cmd="$down_cmd && sh install webmin unstable && \
-             sh install cloudmin unstable"
-        msg="$install_pre_msg unstable repository"
-        ;;
-      prerelease)
-        cmd="$down_cmd && sh install webmin prerelease && \
-             sh install cloudmin prerelease"
-        msg="$install_pre_msg prerelease repository"
-        ;;
-      *)
-        return 1
-        ;;
-    esac
-    run_ok "$cmd" "$msg"
-  fi
-}
-
-# Test if grade B system
-grade_b_system() {
-  case "$os_type" in
-    rhel | centos | rocky | almalinux | debian)
-      return 1
-      ;;
-    ubuntu)
-      case "$os_version" in
-        *\.10|*[13579].04) # non-LTS versions are unstable
-          return 0
-          ;;
-        *)
-          return 1
-          ;;
-      esac
-      ;;
-    *)
+  touch "$log" || fail 'Cannot open the log file'
+  CLOUDMIN_INSTALL_TEMPDIR=$(mktemp -d /var/tmp/cloudmin-install.XXXXXX) || fail 'Cannot create temporary directory'
+  export CLOUDMIN_INSTALL_TEMPDIR
+  trap finish EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
+  bind_hook load_slib || fail 'Cannot load the utility library'
+  disk_space_required=4
+  if [ -n "$swap_only" ]; then
+    log_info "Swap setup log is written to $LOG_PATH"
+    log_info 'Started swap setup'
+    swap_plan 0 || { log_error "$swap_error"; swap_abort; }
+    if [ "$swap_action" = none ]; then
+      log_success 'System swap left unchanged.'
       return 0
-      ;;
-  esac
-}
-
-if grade_b_system && [ "$unstable" != 'unstable' ]; then
-  log_error "Unsupported operating system detected. You may be able to install with"
-  log_error "${BOLD}--unstable${NORMAL} flag, but this is not recommended. Consult the installation"
-  log_error "documentation."
-  exit 1
-fi
-
-remove_cloudmin_release() {
-  case "$os_type" in
-  rhel | fedora | centos | centos_stream | rocky | almalinux | openEuler | ol | cloudlinux | amzn )
-    rm -f /etc/yum.repos.d/cloudmin*
-    rm -f /etc/pki/rpm-gpg/RPM-GPG-KEY-cloudmin*
-    rm -f /etc/pki/rpm-gpg/RPM-GPG-KEY-webmin*
-    ;;
-  debian | ubuntu | kali)
-    grep -v "cloudmin" /etc/apt/sources.list >"$CLOUDMIN_INSTALL_TEMPDIR"/sources.list
-    mv "$CLOUDMIN_INSTALL_TEMPDIR"/sources.list /etc/apt/sources.list
-    rm -f /etc/apt/sources.list.d/cloudmin*
-    rm -f /etc/apt/auth.conf.d/cloudmin*
-    rm -f /usr/share/keyrings/debian-cloudmin*
-    rm -f /usr/share/keyrings/debian-webmin*
-    rm -f /usr/share/keyrings/ubuntu-cloudmin*
-    rm -f /usr/share/keyrings/ubuntu-webmin*
-    rm -f /usr/share/keyrings/kali-cloudmin*
-    rm -f /usr/share/keyrings/kali-webmin*
-    ;;
-  esac
-}
-
-fatal() {
-  echo
-  log_fatal "Fatal Error Occurred: $1"
-  printf "${RED}Cannot continue installation.${NORMAL}\\n"
-  remove_cloudmin_release
-  if [ -x "$CLOUDMIN_INSTALL_TEMPDIR" ]; then
-    log_warning "Removing temporary directory and files."
-    rm -rf "$CLOUDMIN_INSTALL_TEMPDIR"
-  fi
-  log_fatal "If you are unsure of what went wrong, you may wish to review the log"
-  log_fatal "in $log"
-  exit 1
-}
-
-success() {
-  log_success "$1 Succeeded."
-}
-
-# Function to find out if some services were pre-installed
-is_preconfigured() {
-  preconfigured=""
-  if command -pv webmin 1>/dev/null 2>&1; then
-    preconfigured="${preconfigured}${YELLOW}${BOLD}Webmin${NORMAL} "
-  fi
-  preconfigured=$(echo "$preconfigured" | sed 's/ /, /g' | sed 's/, $/ /')
-  echo "$preconfigured"
-}
-
-# Function to find out if Cloudmin is already installed, so we can get
-# rid of some of the warning message. Nobody reads it, and frequently
-# folks run the install script on a production system; either to attempt
-# to upgrade, or to "fix" something. That's never the right thing.
-is_installed() {
-  if [ -f "$cloudmin_license_file" ]; then
-    # looks like it's been installed before
+    fi
+    log_info "$(swap_plan_message)" |
+      sed "s/[0-9][0-9]* [GM]iB/${YELLOW}&${NORMAL}/g"
+    if ! confirm 'Apply these swap changes? (y/n) '; then
+      log_info 'Swap setup cancelled; system swap left unchanged.'
+      return 0
+    fi
+    swap_setup 0 || swap_abort
+    log_success 'Swap setup completed successfully.'
     return 0
   fi
-  # Probably not installed? Maybe we should remove license on uninstall, too.
-  return 1
-}
-
-# This function performs a rough uninstallation of Cloudmin
-# all related packages and configurations
-uninstall() {
-  log_debug "Initiating Cloudmin uninstallation procedure"
-  log_debug "Operating system name:    $os_real"
-  log_debug "Operating system version: $os_version"
-  log_debug "Operating system type:    $os_type"
-  log_debug "Operating system major:   $os_major_version"
-
-  if [ "$skipyesno" -ne 1 ]; then
-    echo
-    printf "  ${REDBG}${BLACK}${BOLD} WARNING ${NORMAL}\\n"
-    echo
-    echo "  This operation is highly disruptive and cannot be undone. It removes all of"
-    echo "  the packages and configuration files installed by the Cloudmin installer!"
-    echo
-    echo "  It must never be executed on a live production system!"
-    echo
-    printf " ${RED}Uninstall?${NORMAL} (y/N) "
-    if ! yesno; then
-      exit
-    fi
-  fi
-
-  # Always sleep just a bit in case the user changes their mind
-  sleep 3
-
-  # Go to the temp directory
-  goto_tmpdir
-
-  # Uninstall packages
-  uninstall_packages()
-  {
-    # Detect the package manager
-    case "$os_type" in
-    rhel | fedora | centos | centos_stream | rocky | almalinux | openEuler | ol | cloudlinux | amzn )
-      package_type=rpm
-      if command -pv dnf 1>/dev/null 2>&1; then
-        uninstall_cmd="dnf remove -y"
-        uninstall_cmd_group="dnf groupremove -y"
-        update="dnf clean all ; dnf makecache"
-      else
-        uninstall_cmd="yum remove -y"
-        uninstall_cmd_group="yum groupremove -y"
-        update="yum clean all ; yum makecache"
-      fi
-      ;;
-    debian | ubuntu | kali)
-      package_type=deb
-      uninstall_cmd="apt-get remove --assume-yes --purge"
-      update="apt-get clean ; apt-get update"
-      ;;
-    esac
-    
-    case "$package_type" in
-    rpm)
-      $uninstall_cmd_group "Cloudmin Core" "Cloudmin KVM Stack"
-      $uninstall_cmd wbm-* wbt-* webmin* usermin* cloudmin*
-      os_type="rhel"
-      return 0
-      ;;
-    deb)
-      $uninstall_cmd "cloudmin*" "webmin*" "usermin*"
-      uninstall_cmd_auto="apt-get autoremove --assume-yes"
-      $uninstall_cmd_auto
-      os_type="debian"
-      return 0
-      ;;
-    *)
-      log_error "Unknown package manager, cannot uninstall"
-      return 1
-      ;;
-    esac
-  }
-
-  # Uninstall repos and helper command
-  uninstall_repos()
-  {
-    echo "Removing Cloudmin $cm_version repo configuration"
-    remove_cloudmin_release
-    if [ -f "$cloudmin_license_file" ]; then
-      echo "Removing Cloudmin license"
-      rm "$cloudmin_license_file"
-    fi
-
-    echo "Removing Cloudmin helper command"
-    rm "/usr/sbin/cloudmin"
-    echo "Cloudmin uninstallation complete."
-  }
-  
-  phase_number=${phase_number:-1}
-  phases_total=${phases_total:-1}
-  uninstall_phase_description=${uninstall_phase_description:-"Uninstall"}
-  echo
-  phase "$uninstall_phase_description" "$phase_number"
-  run_ok "uninstall_packages" "Uninstalling Cloudmin $cm_version and all stack packages"
-  run_ok "uninstall_repos" "Uninstalling Cloudmin $cm_version release package"
-  handle_branches
-}
-
-# Phase control
-phase() {
-    phases_total="${phases_total:-4}"
-    phase_description="$1"
-    phase_number="$2"
-    # Print completed phases (green)
-    printf "${GREEN}"
-    for i in $(seq 1 $(( phase_number - 1 ))); do
-        printf "▣"
-    done
-    # Print current phase (yellow)
-    printf "${YELLOW}▣"
-    # Print remaining phases (cyan)
-    for i in $(seq $(( phase_number + 1 )) "$phases_total"); do
-        printf "${CYAN}◻"
-    done
-    log_debug "Phase ${phase_number} of ${phases_total}: ${phase_description}"
-    printf "${NORMAL} Phase ${YELLOW}${phase_number}${NORMAL} of ${GREEN}${phases_total}${NORMAL}: ${phase_description}\\n"
-}
-
-if [ "$mode" = "uninstall" ]; then
-  bind_hook "uninstall"
-  exit 0
-fi
-
-# Calculate disk space requirements (this is a guess, for now)
-disk_space_required=2
-
-# Message to display in interactive mode
-install_msg() {
-  supported="    ${CYANBG}${BLACK}${BOLD}Red Hat Enterprise Linux and derivatives${NORMAL}${CYAN}
-      - RHEL 8 and 9 on x86_64 and aarch64
-      - Alma and Rocky 8 and 9 on x86_64 and aarch64
-      UNSTABLERHEL${NORMAL}
-    ${CYANBG}${BLACK}${BOLD}Debian Linux and derivatives${NORMAL}${CYAN}
-      - Debian 11 and 12 on i386, amd64 and arm64
-      - Ubuntu 20.04 LTS, 22.04 LTS and 24.04 LTS on i386, amd64 and arm64${NORMAL}
-      UNSTABLEDEB${NORMAL}"
-
-  cat <<EOF
-
-  Welcome to the ${ORANGE}${BOLD}Cloudmin $PRODUCT${NORMAL} installer, version ${ORANGE}${BOLD}$VER${NORMAL}
-
-  This script must be run on a freshly installed supported OS. It does not
-  perform updates or upgrades (use your system package manager) or license
-  changes (use the "cloudmin change-license" command).
-
-EOF
-  screen_height=$(tput lines 2>/dev/null || echo 0)
-  # Check if screen height can fit the message entirely
-  if { [ "$screen_height" -gt 0 ] &&
-       [ "$screen_height" -lt 33 ]; } ||
-     [ "$screen_height" -eq 0 ]; then
-      printf " Continue? (y/n) "
-      if ! yesno; then
-          exit
-      fi
-      echo
-  fi
-  cat <<EOF
-  The systems currently supported by the install script are:
-
-EOF
-  supported_all=$supported
-  if [ -n "$unstable" ]; then
-    unstable_rhel="${YELLOW}- Fedora Server 40 and above on x86_64 and aarch64\\n \
-     - CentOS Stream 8 and 9 on x86_64 and aarch64\\n \
-     - Amazon Linux 2023 and above on x86_64 and aarch64\\n \
-     - Oracle Linux 8 and 9 on x86_64 and aarch64\\n \
-     - CloudLinux 8 and 9 on x86_64 and aarch64\\n \
-     - openEuler 24.03 and above on x86_64 and aarch64\\n \
-          ${NORMAL}"
-    unstable_deb="${YELLOW}- Kali Linux Rolling 2023 and above on x86_64 and arm64\\n \
-     - Ubuntu interim (non-LTS) on i386, amd64 and arm64\\n \
-          ${NORMAL}"
-    supported_all=$(echo "$supported_all" | sed "s/UNSTABLERHEL/$unstable_rhel/")
-    supported_all=$(echo "$supported_all" | sed "s/UNSTABLEDEB/$unstable_deb/")
-  else
-    supported_all=$(echo "$supported_all" | sed 's/UNSTABLERHEL//')
-    supported_all=$(echo "$supported_all" | sed 's/UNSTABLEDEB//')
-  fi
-  echo "$supported_all"
-  cat <<EOF
-  If your OS/version/arch is not listed, installation ${BOLD}${RED}will fail${NORMAL}. More
-  details about the systems supported by the script can be found here:
-
-    ${UNDERLINE}https://www.cloudmin.com/os-support${NORMAL}
-
-  The installation will require up to ${CYAN}${disk_space_required} GB${NORMAL} of disk space. The selected
-  package bundle is ${CYAN}${bundle}${NORMAL} and the type of install is ${CYAN}${mode}${NORMAL}. More details
-  about the package bundles and types can be found here:
-
-    ${UNDERLINE}https://www.cloudmin.com/installation-variations${NORMAL}
-
-EOF
-
-  if [ "$skipyesno" -ne 1 ]; then
-  cat <<EOF
-  Exit and re-run this script with ${CYAN}--help${NORMAL} flag to see available options.
-
-EOF
-  fi
-  if [ "$skipyesno" -ne 1 ]; then
-    printf " Continue? (y/n) "
-    if ! yesno; then
-      exit
-    fi
-  fi
-}
-
-if [ -z "$setup_only" ] && [ -z "$skipbanner" ]; then
-    bind_hook "install_msg"
-fi
-
-os_unstable_pre_check() {
-  if [ -n "$unstable" ]; then
-    cat <<EOF
-
-  ${YELLOWBG}${BLACK}${BOLD} INSTALLATION WARNING ${NORMAL}
-
-  You are about to install Cloudmin $PRODUCT on a ${BOLD}Grade B${NORMAL} operating
-  system. Be advised that this OS version is not recommended for servers,
-  and may have bugs that could affect the performance and stability of
-  the system.
-
-  Certain features may not work as intended or might be unavailable on
-  this OS.
-
-EOF
-    if [ "$skipyesno" -ne 1 ]; then
-      printf " Continue? (y/n) "
-      if ! yesno; then
-        exit
-      fi
-    fi
-  fi
-}
-
-unstable_repos_system_msg() {
-  if [ -n "$branch" ]; then
-    if [ "$branch" = "unstable" ]; then
-      cat <<EOF
-
-  ${REDBG}${WHITE}${BOLD} DANGER ${NORMAL}
-
-  You have enabled the unstable development branch, where packages are built
-  automatically with every commit to the repositories of each product we
-  offer. This branch is strictly for testing and development purposes
-  and must not be used in a production environment!
-
-EOF
-    elif [ "$branch" = "prerelease" ]; then
-      cat <<EOF
-
-  ${YELLOWBG}${BLACK}${BOLD} NOTICE ${NORMAL}
-
-  You have enabled the prerelease branch, where packages are automatically
-  built for tagged releases of each product we offer. This branch provides
-  early access to features and updates before they are included in the
-  stable branch.
-
-EOF
-    fi
-    
-    if [ "$skipyesno" -ne 1 ]; then
-      printf " Continue with $branch branch? (y/n) "
-      if ! yesno; then
-        exit
-      fi
-    fi
-  fi
-}
-
-preconfigured_system_msg() {
-  # Double check if installed, just in case above error ignored.
-  is_preconfigured_rs=$(is_preconfigured)
-  if [ -n "$is_preconfigured_rs" ]; then
-    cat <<EOF
-
-  ${WHITEBG}${RED}${BOLD} ATTENTION ${NORMAL}
-
-  Pre-installed software detected: $is_preconfigured_rs
-
-  It is highly advised ${BOLD}${RED}not to pre-install${NORMAL} any additional packages on your
-  OS. The installer expects a freshly installed OS, and anything you do
-  differently might cause conflicts or configuration errors. If you need
-  to enable third-party package repositories, do so after installation
-  of Cloudmin, and only with extreme caution.
-
-EOF
-    if [ "$skipyesno" -ne 1 ]; then
-      printf " Continue? (y/n) "
-      if ! yesno; then
-        exit
-      fi
-    fi
-  fi
-}
-
-already_installed_msg() {
-  # Double check if installed, just in case above error ignored.
-  if is_installed; then
-    cat <<EOF
-
-  ${WHITEBG}${RED}${BOLD} WARNING ${NORMAL}
-
-  Cloudmin may already be installed. This can happen if an installation
-  failed, and can be ignored in that case.
-
-  However, if Cloudmin has already been successfully installed you
-  ${BOLD}${RED}must not${NORMAL} run this script again! It will cause breakage to your
-  existing configuration.
-
-  Cloudmin repositories can be fixed using ${WHITEBG}${BLACK}${BOLD}$script_name --setup${NORMAL}
-  command.
-
-  License can be changed using ${WHITEBG}${BLACK}${BOLD}cloudmin change-license${NORMAL} command.
-  Changing the license never requires re-installation.
-
-  Updates and upgrades must be performed from within either Cloudmin or
-  using system package manager on the command line.
-
-EOF
-    if [ "$skipyesno" -ne 1 ]; then
-      printf " Continue? (y/n) "
-      if ! yesno; then
-        exit
-      fi
-    fi
-  fi
-}
-
-post_install_message() {
-  log_success "Installation Complete!"
-  log_success "If there were no errors above, Cloudmin should be ready to configure"
-  log_success "at https://${hostname}:10000 (or https://${address}:10000)."
-  if [ -z "$ssl_host_success" ]; then
-    log_success "You will see a security warning in the browser on your first visit."
-  fi
-}
-
-if [ -z "$setup_only" ] && [ -z "$skipbanner" ]; then
-  if grade_b_system; then
-    bind_hook "os_unstable_pre_check"
-  fi
-  bind_hook "unstable_repos_system_msg"
-  bind_hook "preconfigured_system_msg"
-  bind_hook "already_installed_msg"
-fi
-
-# Check memory
-minimum_memory=3221226
-
-if ! memory_ok "$minimum_memory" "$disk_space_required"; then
-  log_fatal "Too little memory, and unable to create a swap file. Consider adding swap"
-  log_fatal "or more RAM to your system."
-  exit 1
-fi
-
-# Check for localhost in /etc/hosts
-if [ -z "$setup_only" ]; then
-  grep localhost /etc/hosts >/dev/null
-  if [ "$?" != 0 ]; then
-    log_warning "There is no localhost entry in /etc/hosts. This is required, so one will be added."
-    run_ok "echo 127.0.0.1 localhost >> /etc/hosts" "Editing /etc/hosts"
-    if [ "$?" -ne 0 ]; then
-      log_error "Failed to configure a localhost entry in /etc/hosts."
-      log_error "This may cause problems, but we'll try to continue."
-    fi
-  fi
-fi
-
-pre_check_system_time() {
-  # Check if current time
-  # is not older than
-  # Wed Dec 01 2022
-  printf "Syncing system time ..\\n" >>"$log"
-  TIMEBASE=1669888800
-  TIME=$(date +%s)
-  if [ "$TIME" -lt "$TIMEBASE" ]; then
-
-    # Try to sync time automatically first
-    if systemctl restart chronyd 1>/dev/null 2>&1; then
-      sleep 30
-    elif systemctl restart systemd-timesyncd 1>/dev/null 2>&1; then
-      sleep 30
-    fi
-
-    # Check again after all
-    TIME=$(date +%s)
-    if [ "$TIME" -lt "$TIMEBASE" ]; then
-      printf ".. failed to automatically sync system time; it should be corrected manually to continue\\n" >>"$log"
-      return 1;
-    fi
-  # Graceful sync
-  else
-    if systemctl restart chronyd 1>/dev/null 2>&1; then
-      sleep 10
-    elif systemctl restart systemd-timesyncd 1>/dev/null 2>&1; then
-      sleep 10
-    fi
-  fi
-  printf ".. done\\n" >>"$log"
-  return 0
-}
-
-pre_check_ca_certificates() {
-  printf "Checking for an update for a set of CA certificates ..\\n" >>"$log"
-  if [ -x /usr/bin/dnf ]; then
-    dnf -y update ca-certificates >>"$log" 2>&1
-  elif [ -x /usr/bin/yum ]; then
-    yum -y update ca-certificates >>"$log" 2>&1
-  elif [ -x /usr/bin/apt-get ]; then
-    apt-get -y install ca-certificates >>"$log" 2>&1
-  fi
-  res=$?
-  printf ".. done\\n" >>"$log"
-  return "$res"
-}
-
-pre_check_perl() {
-  printf "Checking for Perl .." >>"$log"
-  # loop until we've got a Perl or until we can't try any more
-  while true; do
-    perl="$(command -pv perl 2>/dev/null)"
-    if [ -z "$perl" ]; then
-      if [ -x /usr/bin/perl ]; then
-        perl=/usr/bin/perl
-        break
-      elif [ -x /usr/local/bin/perl ]; then
-        perl=/usr/local/bin/perl
-        break
-      elif [ -x /opt/csw/bin/perl ]; then
-        perl=/opt/csw/bin/perl
-        break
-      elif [ "$perl_attempted" = 1 ]; then
-        printf ".. Perl could not be installed. Cannot continue\\n" >>"$log"
-        return 1
-      fi
-      # couldn't find Perl, so we need to try to install it
-      if [ -x /usr/bin/dnf ]; then
-        dnf -y install perl >>"$log" 2>&1
-      elif [ -x /usr/bin/yum ]; then
-        yum -y install perl >>"$log" 2>&1
-      elif [ -x /usr/bin/apt-get ]; then
-        apt-get update >>"$log" 2>&1
-        apt-get -q -y install perl >>"$log" 2>&1
-      fi
-      perl_attempted=1
-      # Loop. Next loop should either break or exit.
-    else
-      break
-    fi
-  done
-  printf ".. found Perl at $perl\\n" >>"$log"
-  return 0
-}
-
-pre_check_gpg() {
-  if [ -x /usr/bin/apt-get ]; then
-    printf "Checking for GPG .." >>"$log"
-    if [ ! -x /usr/bin/gpg ]; then
-      printf " not found, attempting to install .." >>"$log"
-      apt-get update >>/dev/null
-      apt-get -y -q install gnupg >>"$log"
-      printf " finished : $?\\n" >>"$log"
-    else
-      printf " found GPG command\\n" >>"$log"
-    fi
-  fi
-}
-
-pre_check_all() {
-  
-  if [ -z "$setup_only" ]; then
-    # Check system time
-    run_ok pre_check_system_time "Checking system time"
-    
-    # Make sure Perl is installed
-    run_ok pre_check_perl "Checking Perl installation"
-
-    # Update CA certificates package
-    run_ok pre_check_ca_certificates "Checking CA certificates package"
-  else
-    # Make sure Perl is installed
-    run_ok pre_check_perl "Checking Perl installation"
-  fi
-
-  # Checking for HTTP client
-  run_ok pre_check_http_client "Checking HTTP client"
-
-  # Check for gpg, debian 10 doesn't install by default!?
-  run_ok pre_check_gpg "Checking GPG package"
-}
-
-# download()
-# Use $download to download the provided filename or exit with an error.
-download() {
-  # Check this to make sure run_ok is doing the right thing.
-  # Especially make sure failure gets logged right.
-  # awk magic prints the filename, rather than whole URL
-  export download_file
-  download_file=$(echo "$1" | awk -F/ '{print $NF}')
-  run_ok "$download $1" "$2"
-  if [ $? -ne 0 ]; then
-    fatal "Failed to download Cloudmin release package. Cannot continue. Check your network connection and DNS settings, and verify that your system's time is accurately synchronized."
-  else
+  if [ -n "$uninstall_mode" ]; then
+    log_info "Uninstallation log is written to $LOG_PATH"
+    bind_hook uninstall || fail "Uninstallation failed; see $log"
     return 0
   fi
-}
-
-# Only root can run this
-if [ "$(id -u)" -ne 0 ]; then
-  uname -a | grep -i CYGWIN >/dev/null
-  if [ "$?" != "0" ]; then
-    fatal "${RED}Fatal:${NORMAL} The Cloudmin install script must be run as root"
-  fi
-fi
-
-bind_hook "phases_all_pre"
-
-if [ -n "$setup_only" ]; then
-  pre_check_perl
-  pre_check_http_client
-  pre_check_gpg
-  log_info "Started Cloudmin $cm_version $PRODUCT software repositories setup"
-else
-  echo
-  phase "Check" 1
-  bind_hook "phase1_pre"
-  pre_check_all
-  bind_hook "phase1_post"
-  echo
-
-  phase "Setup" 2
-  bind_hook "phase2_pre"
-fi
-
-# Print out some details that we gather before logging existed
-log_debug "Install mode: $mode"
-log_debug "Product: Cloudmin $PRODUCT"
-log_debug "cloudmin-install.sh version: $VER"
-
-# Check for a fully qualified hostname
-if [ -z "$setup_only" ]; then
-  log_debug "Checking for fully qualified hostname .."
-  name="$(hostname -f)"
-  if [ $? -ne 0 ]; then
-    name=$(hostnamectl --static)
-  fi
-  if [ -n "$forcehostname" ]; then
-    set_hostname "$forcehostname"
-  elif ! is_fully_qualified "$name"; then
-    set_hostname
+  if [ -n "$setup" ]; then
+    log_info "Setup log is written to $LOG_PATH"
+    log_info 'Started Cloudmin 10 GPL software repositories setup'
   else
-    # Hostname is already FQDN, yet still set it 
-    # again to make sure to have it updated everywhere
-    set_hostname "$name"
-  fi
-fi
-
-# Insert the serial number and password into license file
-log_debug "Installing serial number and license key into '$cloudmin_license_file'"
-echo "SerialNumber=$SERIAL" > "$cloudmin_license_file"
-echo "LicenseKey=$KEY" >> "$cloudmin_license_file"
-chmod 700 "$cloudmin_license_file"
-cd ..
-
-# Populate some distro version globals
-log_debug "Operating system name:    $os_real"
-log_debug "Operating system version: $os_version"
-log_debug "Operating system type:    $os_type"
-log_debug "Operating system major:   $os_major_version"
-
-install_cloudmin_release() {
-  # Grab cloudmin-release from the server
-  log_debug "Configuring package manager for ${os_real} ${os_version} .."
-  case "$os_type" in
-  rhel | fedora | centos | centos_stream | rocky | almalinux | openEuler | ol | cloudlinux | amzn )
-    case "$os_type" in
-    rhel | centos | centos_stream)
-      if [ "$os_type" = "centos_stream" ]; then
-        if [ "$os_major_version" -lt 8 ]; then
-          printf "${RED}${os_real} ${os_version}${NORMAL} is not supported by this installer.\\n"
-          exit 1
-        fi
-      else
-        if [ "$os_major_version" -lt 7 ]; then
-          printf "${RED}${os_real} ${os_version}${NORMAL} is not supported by this installer.\\n"
-          exit 1
-        fi
-      fi
-      ;;
-    rocky | almalinux | openEuler | ol)
-      if [ "$os_major_version" -lt 8 ]; then
-        printf "${RED}${os_real} ${os_version}${NORMAL} is not supported by this installer.\\n"
-        exit 1
-      fi
-      ;;
-    cloudlinux)
-      if [ "$os_major_version" -lt 8 ] && [ "$os_type" = "cloudlinux" ]; then
-        printf "${RED}${os_real} ${os_version}${NORMAL} is not supported by this installer.\\n"
-        exit 1
-      fi
-      ;;
-    fedora)
-      if [ "$os_major_version" -lt 35 ] && [ "$os_type" = "fedora" ]  ; then
-        printf "${RED}${os_real} ${os_version}${NORMAL} is not supported by this installer.\\n"
-        exit 1
-      fi
-      ;;
-    amzn)
-      if [ "$os_major_version" -lt 2023 ] && [ "$os_type" = "amzn" ]  ; then
-        printf "${RED}${os_real} ${os_version}${NORMAL} is not supported by this installer.\\n"
-        exit 1
-      fi
-      ;;
-    *)
-      printf "${RED}This OS/version is not recognized! Cannot continue!${NORMAL}\\n"
-      exit 1
-      ;;
-    esac
-    if [ -x /usr/sbin/setenforce ]; then
-      log_debug "Disabling SELinux during installation .."
-      if /usr/sbin/setenforce 0 1>/dev/null 2>&1; then
-        log_debug " setenforce 0 succeeded"
-      else
-        log_debug "  setenforce 0 failed: $?"
-      fi
+    log_info "Installation log is written to $LOG_PATH"
+    [ -n "$noswap" ] || swap_plan "$disk_space_required" || { log_error "$swap_error"; swap_abort; }
+    if [ -z "$skipbanner" ]; then
+      bind_hook install_msg || fail 'Cannot display installation summary'
+      bind_hook unstable_repos_system_msg || fail 'Cannot display repository warning'
+      bind_hook preconfigured_system_msg || fail 'Cannot check pre-installed software'
+      bind_hook already_installed_msg || fail 'Cannot check existing installation'
     fi
-    package_type="rpm"
-    if command -pv dnf 1>/dev/null 2>&1; then
-      install_cmd="dnf"
-      install="$install_cmd -y install"
-      upgrade="$install_cmd -y update"
-      update="$install_cmd clean all ; $install_cmd makecache"
-      install_group_opts="-y --quiet --skip-broken group install --setopt=group_package_types=mandatory,default"
-      install_group="$install_cmd $install_group_opts"
-      install_config_manager="$install_cmd config-manager"
-      # Do not use package manager when fixing repos
-      if [ -z "$setup_only" ]; then
-        run_ok "$install dnf-plugins-core" "Installing core plugins for package manager"
-      fi
-    else
-      install_cmd="yum"
-      install="$install_cmd -y install"
-      upgrade="$install_cmd -y update"
-      update="$install_cmd clean all ; $install_cmd makecache"
-      if [ "$os_major_version" -ge 7 ]; then
-        # Do not use package manager when fixing repos
-        if [ -z "$setup_only" ]; then
-          run_ok "$install_cmd --quiet groups mark convert" "Updating groups metadata"
-        fi
-      fi
-      install_group_opts="-y --quiet --skip-broken groupinstall --setopt=group_package_types=mandatory,default"
-      install_group="$install_cmd $install_group_opts"
-      install_config_manager="yum-config-manager"
-    fi
-
-    # Download release file unless a different branch is specified
-    if [ -z "$branch" ]; then
-      rpm_release_file_download="cloudmin-$packagetype-release.noarch.rpm"
-      download "https://${LOGIN}$download_cloudmin_host/vm/$cm_version/rpm/$rpm_release_file_download" "Downloading Cloudmin $cm_version release package"
-      
-      # Remove existing pkg files as they will not
-      # be replaced upon replease package upgrade
-      if [ -x "/usr/bin/rpm" ]; then
-        rpm_release_files="$(rpm -qal cloudmin*release)"
-        rpm_release_files=$(echo "$rpm_release_files" | tr '\n' ' ')
-        if [ -n "$rpm_release_files" ]; then
-          for rpm_release_file in $rpm_release_files; do
-            rm -f "$rpm_release_file"
-          done
-        fi
-      fi
-
-      # Remove releases first, as the system can
-      # end up having both GPL and Pro installed
-      rpm -e --nodeps --quiet "$(rpm -qa cloudmin*release 2>/dev/null)" >> "$RUN_LOG" 2>&1
-
-      # Install release file
-      run_ok "rpm -U --replacepkgs --replacefiles --quiet $rpm_release_file_download" "Installing Cloudmin $cm_version release package"
-
-      # Fix login credentials if fixing repos
-      if [ -n "$setup_only" ]; then
-        sed -i "s/SERIALNUMBER:LICENSEKEY@/$LOGIN/" /etc/yum.repos.d/cloudmin.repo
-        sed -i 's/http:\/\//https:\/\//' /etc/yum.repos.d/cloudmin.repo
-      fi
-    fi
-    ;;
-  debian | ubuntu | kali)
-    case "$os_type" in
-    ubuntu)
-      case "$os_version:$unstable" in
-        18.04:*|20.04:*|22.04:*|24.04:*|*\.10:unstable|*[13579].04:unstable)
-          : ;; # Do nothing for supported or allowed unstable versions
-        *)
-          printf "${RED}${os_real} ${os_version} is not supported by this installer.${NORMAL}\\n"
-          exit 1
-          ;;
-      esac
-      ;;
-    debian)
-      if [ "$os_major_version" -lt 10 ]; then
-        printf "${RED}${os_real} ${os_version} is not supported by this installer.${NORMAL}\\n"
-        exit 1
-      fi
-      ;;
-    kali)
-      if [ "$os_major_version" -lt 2023 ] && [ "$os_type" = "kali" ]  ; then
-        printf "${RED}${os_real} ${os_version}${NORMAL} is not supported by this installer.\\n"
-        exit 1
-      fi
-      ;;
-    esac
-    package_type="deb"
-    if [ "$os_type" = "ubuntu" ]; then
-      deps="$ubudeps"
-      repos="cloudmin"
-    else
-      deps="$debdeps"
-      repos="cloudmin"
-    fi
-    log_debug "apt-get repos: ${repos}"
-    if [ -z "$repos" ]; then # Probably unstable with no version number
-      log_fatal "No repositories available for this OS. Are you running unstable/testing?"
-      exit 1
-    fi
-    # Remove any existing repo config, in case it's a reinstall
-    remove_cloudmin_release
-    
-    # Set correct keys name for Debian vs derivatives
-    # Download release file unless a different branch is specified
-    if [ -z "$branch" ]; then
-      repoid_debian_like=debian
-      if [ -n "${os_type}" ]; then
-        repoid_debian_like="${os_type}"
-      fi
-
-      # Setup repo file
-      apt_auth_dir='/etc/apt/auth.conf.d'
-      LOGINREAL=$LOGIN
-      if [ -d "$apt_auth_dir" ]; then
-        if [ -n "$LOGIN" ]; then
-          LOGINREAL=""
-          printf "machine $download_cloudmin_host login $SERIAL password $KEY\\n" >"$apt_auth_dir/cloudmin.conf"
-        fi
-      fi
-      for repo in $repos; do
-        printf "deb [signed-by=/usr/share/keyrings/$repoid_debian_like-cloudmin-$cm_version.gpg] https://${LOGINREAL}$download_cloudmin_host/vm/${cm_version}/${repopath}apt ${repo} main\\n" >/etc/apt/sources.list.d/cloudmin.list
-      done
-
-      # Install our keys
-      log_debug "Installing Webmin and Cloudmin package signing keys .."
-      download "https://$download_cloudmin_host_lib/RPM-GPG-KEY-cloudmin-$cm_version" "Downloading Cloudmin $cm_version key"
-      run_ok "gpg --import RPM-GPG-KEY-cloudmin-$cm_version && cat RPM-GPG-KEY-cloudmin-$cm_version | gpg --dearmor > /usr/share/keyrings/$repoid_debian_like-cloudmin-$cm_version.gpg" "Installing Cloudmin $cm_version key"
-      run_ok "apt-get update" "Downloading repository metadata"
-    fi
-    # Make sure universe repos are available
-    if [ "$os_type" = "ubuntu" ]; then
-      if [ -x "/bin/add-apt-repository" ] || [ -x "/usr/bin/add-apt-repository" ]; then
-        run_ok "add-apt-repository -y universe" \
-          "Enabling universe repositories, if not already available"
-      else
-        run_ok "sed -ie '/backports/b; s/#*[ ]*deb \\(.*\\) universe$/deb \\1 universe/' /etc/apt/sources.list" \
-          "Enabling universe repositories, if not already available"
-      fi
-    fi
-    # Is this still enabled by default on Debian/Ubuntu systems?
-    run_ok "sed -ie 's/^deb cdrom:/#deb cdrom:/' /etc/apt/sources.list" "Disabling cdrom: repositories"
-    install="DEBIAN_FRONTEND='noninteractive' /usr/bin/apt-get --quiet --assume-yes --install-recommends -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' -o Dpkg::Pre-Install-Pkgs::='/usr/sbin/dpkg-preconfigure --apt' install"
-    upgrade="DEBIAN_FRONTEND='noninteractive' /usr/bin/apt-get --quiet --assume-yes --install-recommends -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' -o Dpkg::Pre-Install-Pkgs::='/usr/sbin/dpkg-preconfigure --apt' upgrade"
-    update="/usr/bin/apt-get clean ; /usr/bin/apt-get update"
-    install_updates="$install $deps"
-    run_ok "apt-get clean" "Cleaning up software repo metadata"
-    sed -i "s/\\(deb[[:space:]]file.*\\)/#\\1/" /etc/apt/sources.list
-    ;;
-  *)
-    log_error " Your OS is not currently supported by this installer. Nevertheless, you"
-    log_error " should still be able to run Cloudmin on your system by following the"
-    log_error " manual installation process."
-    exit 1
-    ;;
-  esac
-
-  return 0
-}
-
-# Setup repos only
-if [ -n "$setup_only" ]; then
-  if install_cloudmin_release; then
-    handle_branches
-    log_success "Repository configuration successful. You can now install Cloudmin"
-    log_success "components using your OS package manager."
-  else
-    log_error "Errors occurred during setup of Cloudmin software repositories. You may find more"
-    log_error "information in ${RUN_LOG}."
   fi
-  exit $?
-fi
-
-# Install Functions
-install_with_apt() {
-  # Install system package upgrades, if any
-  if [ -z "$noupdates" ]; then
-    run_ok "$upgrade" "Checking and installing system package updates"
+  bind_hook phases_all_pre || fail 'Installation hook failed'
+  if [ -z "$setup" ]; then
+    printf '\n'
+    bind_hook phase Check 1 || fail 'Phase hook failed'
+    bind_hook phase1_pre || fail 'Check hook failed'
+    run 'Checking operating system and KVM support' bind_hook preflight
+    bind_hook phase1_post || fail 'Check hook failed'
+    printf '\n'
+    bind_hook phase Setup 2 || fail 'Phase hook failed'
+    bind_hook phase2_pre || fail 'Setup hook failed'
+    [ -n "$noswap" ] || swap_setup "$disk_space_required" || swap_abort
   fi
-
-  # Silently purge packages that may cause issues upon installation
-  /usr/bin/apt-get --quiet --assume-yes purge ufw >> "$RUN_LOG" 2>&1
-
-  # Install Webmin/Usermin first, because it needs to be already done
-  # for the deps. Then install Cloudmin Core and then Stack packages
-  # Do it all in one go for the nicer UI
-  run_ok "$install webmin && $install usermin && $install $debvmpackages && $install $deps" "Installing Cloudmin $cm_version and all related packages"
-  if [ $? -ne 0 ]; then
-    log_warning "apt-get seems to have failed. Are you sure your OS and version is supported?"
-    log_warning "https://www.cloudmin.com/os-support"
-    fatal "Installation failed: $?"
-  fi
-
-  return 0
-}
-
-install_with_yum() {
-  # Enable CodeReady and EPEL on RHEL 8+
-  if [ "$os_major_version" -ge 8 ] && [ "$os_type" = "rhel" ]; then
-    # Important Perl packages are now hidden in CodeReady repo
-    run_ok "$install_config_manager --set-enabled codeready-builder-for-rhel-$os_major_version-x86_64-rpms" "Enabling Red Hat CodeReady package repository"
-    # Install EPEL
-    download "https://dl.fedoraproject.org/pub/epel/epel-release-latest-$os_major_version.noarch.rpm" >>"$log" 2>&1
-    run_ok "rpm -U --replacepkgs --quiet epel-release-latest-$os_major_version.noarch.rpm" "Installing EPEL $os_major_version release package"
-  # Install EPEL on RHEL 7
-  elif [ "$os_major_version" -eq 7 ] && [ "$os_type" = "rhel" ]; then
-    download "https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm" >>"$log" 2>&1
-    run_ok "rpm -U --replacepkgs --quiet epel-release-latest-7.noarch.rpm" "Installing EPEL 7 release package"
-  # Install EPEL on CentOS/Alma/Rocky
-  elif [ "$os_type" = "centos" ] || [ "$os_type" = "centos_stream" ] || [ "$os_type" = "rocky" ] || [ "$os_type" = "almalinux" ]; then  
-    run_ok "$install epel-release" "Installing EPEL release package"
-  # CloudLinux EPEL 
-  elif [ "$os_type" = "cloudlinux" ]; then
-    # Install EPEL on CloudLinux
-    download "https://dl.fedoraproject.org/pub/epel/epel-release-latest-$os_major_version.noarch.rpm" >>"$log" 2>&1
-    run_ok "rpm -U --replacepkgs --quiet epel-release-latest-$os_major_version.noarch.rpm" "Installing EPEL $os_major_version release package"
-  # Install EPEL on Oracle 7+
-  elif [ "$os_type" = "ol" ]; then
-    run_ok "$install oracle-epel-release-el$os_major_version" "Installing EPEL release package"
-  # Installation on Amazon Linux
-  elif [ "$os_type" = "amzn" ]; then
-    # Set for installation packages whichever available on Amazon Linux as they
-    # go with different name, e.g. mariadb105-server instead of mariadb-server
-    cloudmin_stack_custom_packages="mariadb*-server"
-    # Exclude from config what's not available on Amazon Linux
-    cloudmin_config_system_excludes=" --exclude AWStats --exclude Etckeeper --exclude Fail2banFirewalld --exclude ProFTPd"
-  fi
-
-  # Important Perl packages are now hidden in PowerTools repo
-  if [ "$os_major_version" -ge 8 ] && [ "$os_type" = "centos" ] || [ "$os_type" = "centos_stream" ] || [ "$os_type" = "rocky" ] || [ "$os_type" = "almalinux" ] || [ "$os_type" = "cloudlinux" ]; then
-    # Detect CRB/PowerTools repo name
-    if [ "$os_major_version" -ge 9 ]; then
-      extra_packages=$(dnf repolist all | grep "^crb")
-      if [ -n "$extra_packages" ]; then
-        extra_packages="crb"
-        extra_packages_name="CRB"
-      fi
-    else
-      extra_packages=$(dnf repolist all | grep "^powertools")
-      extra_packages_name="PowerTools"
-      if [ -n "$extra_packages" ]; then
-        extra_packages="powertools"
-      else
-        extra_packages="PowerTools"
-      fi
-    fi
-
-    run_ok "$install_config_manager --set-enabled $extra_packages" "Enabling $extra_packages_name package repository"
-  fi
-
-
-  # Important Perl packages are hidden in ol8_codeready_builder repo in Oracle
-  if [ "$os_major_version" -ge 8 ] && [ "$os_type" = "ol" ]; then
-    run_ok "$install_config_manager --set-enabled ol${os_major_version}_codeready_builder" "Enabling Oracle Linux $os_major_version CodeReady Builder"
-  fi
-
-  # This is so stupid. Why does yum insists on extra commands?
-  if [ "$os_major_version" -eq 7 ]; then
-    run_ok "yum --quiet groups mark install $rhgroup" "Marking $rhgrouptext for install"
-    run_ok "yum --quiet groups mark install $vmgroup" "Marking $vmgrouptext for install"
-  fi
-  
-  # Clear cache
-  run_ok "$install_cmd clean all" "Cleaning up software repo metadata"
-
-  # Upgrade system packages first
-  if [ -z "$noupdates" ]; then
-    run_ok "$upgrade" "Checking and installing system package updates"
-  fi
-
-  # Install custom stack packages
-  if [ -n "$cloudmin_stack_custom_packages" ]; then
-    run_ok "$install $cloudmin_stack_custom_packages" "Installing missing stack packages"
-  fi
-
-  # Install core and stack
-  run_ok "$install_group $rhgroup" "Installing dependencies and system packages"
-  run_ok "$install_group $vmgroup" "Installing Cloudmin $cm_version and all related packages"
-  rs=$?
-  if [ $? -ne 0 ]; then
-    fatal "Installation failed: $rs"
-  fi
-
-  return 0
-}
-
-install_cloudmin() {
-  case "$package_type" in
-  rpm)
-    install_with_yum
-    ;;
-  deb)
-    install_with_apt
-    ;;
-  *)
-    install_with_tar
-    ;;
-  esac
-  rs=$?
-  if [ $? -eq 0 ]; then
+  bind_hook repositories || fail "Repository setup failed; see $log"
+  if [ -n "$setup" ]; then
+    bind_hook phases_all_post || fail 'Setup hook failed'
+    log_success 'Cloudmin repository is configured successfully.'
     return 0
-  else
-    return "$rs"
   fi
+  bind_hook phase2_post || fail 'Setup hook failed'
+  printf '\n'
+  bind_hook phase Installation 3 || fail 'Phase hook failed'
+  bind_hook phase3_pre || fail 'Installation hook failed'
+  bind_hook install_cloudmin || fail "Package installation failed; see $log"
+  bind_hook phase3_post || fail 'Installation hook failed'
+  bind_hook load_module || fail 'Post-install module failed'
+  printf '\n'
+  bind_hook phase Configuration 4 || fail 'Phase hook failed'
+  bind_hook phase4_pre || fail 'Configuration hook failed'
+  bind_hook configure || fail "Cloudmin configuration failed; see $log"
+  bind_hook phase4_post || fail 'Configuration hook failed'
+  bind_hook extra_phases || fail 'Additional installation phase failed'
+  bind_hook phases_all_post || fail 'Installation hook failed'
+  bind_hook clean_pre || fail 'Cleanup hook failed'
+  printf '%s▣▣▣%s Cleaning up\n' "$GREEN" "$NORMAL"
+  cd "$script_dir" || fail 'Cannot leave temporary directory'
+  rm -rf -- "$CLOUDMIN_INSTALL_TEMPDIR" || fail 'Cannot remove temporary directory'
+  CLOUDMIN_INSTALL_TEMPDIR=
+  bind_hook clean_post || fail 'Cleanup hook failed'
+  printf '\n'
+  bind_hook post_install_message || fail 'Post-install message hook failed'
 }
 
-yum_check_skipped() {
-  loginstalled=0
-  logskipped=0
-  skippedpackages=""
-  skippedpackagesnum=0
-  while IFS= read -r line
-  do
-    if [ "$line" = "Installed:" ]; then
-      loginstalled=1
-    elif [ "$line" = "" ]; then
-      loginstalled=0
-      logskipped=0
-    elif [ "$line" = "Skipped:" ] && [ "$loginstalled" = 1 ]; then
-      logskipped=1
-    elif [ "$logskipped" = 1 ]; then
-      skippedpackages="$skippedpackages$line"
-      skippedpackagesnum=$((skippedpackagesnum+1))
-    fi
-  done < "$log"
-  if [ -z "$noskippedpackagesforce" ] && [ "$skippedpackages" != "" ]; then
-    if [ "$skippedpackagesnum" != 1 ]; then
-      ts="s"
-    fi
-    skippedpackages=$(echo "$skippedpackages" | tr -s ' ')
-    log_warning "Skipped package${ts}:${skippedpackages}"
-  fi
-}
-
-# cloudmin-release only exists for one platform...but it's as good a function
-# name as any, I guess.  Should just be "setup_repositories" or something.
-errors=$((0))
-install_cloudmin_release
-handle_branches
-bind_hook "phase2_post"
-echo
-phase "Installation" 3
-bind_hook "phase3_pre"
-install_cloudmin
-if [ "$?" != "0" ]; then
-  errorlist="${errorlist}  ${YELLOW}◉${NORMAL} Package installation returned an error.\\n"
-  errors=$((errors + 1))
-fi
-
-# We want to make sure we're running our version of packages if we have
-# our own version.  There's no good way to do this, but we'll
-run_ok "$install_updates" "Installing Cloudmin $cm_version related package updates"
-if [ "$?" != "0" ]; then
-  errorlist="${errorlist}  ${YELLOW}◉${NORMAL} Installing updates returned an error.\\n"
-  errors=$((errors + 1))
-fi
-
-bind_hook "phase3_post"
-
-# Initialize embedded module if any
-if [ -n "$module_name" ]; then
-  bind_hook "modules_pre"
-  # If module is available locally in the same directory use it
-  if [ -f "$pwd/${module_name}.sh" ]; then
-    chmod +x "$pwd/${module_name}.sh"
-    # shellcheck disable=SC1090
-    . "$pwd/${module_name}.sh"
-  else
-    log_warning "Requested module with the filename $pwd/${module_name}.sh does not exist."
-  fi
-  bind_hook "modules_post"
-fi
-
-# Reap any clingy processes (like spinner forks)
-# get the parent pids (as those are the problem)
-allpids="$(ps -o pid= --ppid $$) $allpids"
-for pid in $allpids; do
-  kill "$pid" 1>/dev/null 2>&1
-done
-
-# Final step is configuration. Wait here for a moment, hopefully letting any
-# apt processes disappear before we start, as they're huge and memory is a
-# problem.
-sleep 1
-echo
-phase "Configuration" 4
-bind_hook "phase4_pre"
-# shellcheck disable=SC2086
-cloudmin-config-system --bundle "$bundle" $cloudmin_config_system_excludes --log "$log"
-if [ "$?" != "0" ]; then
-  errorlist="${errorlist}  ${YELLOW}◉${NORMAL} Postinstall configuration returned an error.\\n"
-  errors=$((errors + 1))
-fi
-sleep 1
-# Do we still need to kill stuck spinners?
-kill $! 1>/dev/null 2>&1
-
-# Log SSL request status, if available
-if [ -f "$CLOUDMIN_INSTALL_TEMPDIR/cloudmin_ssl_host_status" ]; then
-  cloudmin_ssl_host_status=$(cat "$CLOUDMIN_INSTALL_TEMPDIR/cloudmin_ssl_host_status")
-  log_debug "$cloudmin_ssl_host_status"
-fi
-
-# Functions that are used in the OS specific modifications section
-disable_selinux() {
-  seconfigfiles="/etc/selinux/config /etc/sysconfig/selinux"
-  for i in $seconfigfiles; do
-    if [ -e "$i" ]; then
-      perl -pi -e 's/^SELINUX=.*/SELINUX=disabled/' "$i"
-    fi
-  done
-}
-
-# Changes that are specific to OS
-case "$os_type" in
-rhel | fedora | centos | centos_stream | rocky | almalinux | openEuler | ol | cloudlinux | amzn)
-  disable_selinux
-  ;;
-esac
-
-bind_hook "phase4_post"
-
-# Process additional phases if set in third-party functions
-if [ -n "$hooks__phases" ]; then
-    # Trim leading and trailing whitespace
-    trim() {
-        echo "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
-    }
-    bind_hook "phases_pre"
-    unset current_phase
-    phases_error_occurred=0
-    printf '%s\n' "$hooks__phases" | sed '/^$/d' > hooks__phases_tmp
-    while IFS= read -r line; do
-        # Split the line into components
-        phase_number=$(trim "${line%%	*}")
-        rest="${line#*	}"
-        phase_name=$(trim "${rest%%	*}")
-        rest="${rest#*	}"
-        command=$(trim "${rest%%	*}")
-        description=$(trim "${rest#*	}")
-        # If it's a new phase, display phase progress
-        if [ "$phase_number" != "$current_phase" ]; then
-            echo
-            phase "$phase_name" "$phase_number"
-            current_phase="$phase_number"
-        fi
-        # Run the command
-        if ! run_ok "$command" "$description"; then
-            phases_error_occurred=1
-            break
-        fi
-    done < hooks__phases_tmp
-    # Exit if an error occurred
-    if [ "$phases_error_occurred" -eq 1 ]; then
-        exit 1
-    fi
-    bind_hook "phases_post"
-fi
-
-bind_hook "phases_all_post"
-
-# Was LE SSL for hostname request successful?
-if [ -d "$CLOUDMIN_INSTALL_TEMPDIR/cloudmin_ssl_host_success" ]; then
-  ssl_host_success=1
-fi
-
-# Cleanup the tmp files
-bind_hook "clean_pre"
-printf "${GREEN}▣▣▣${NORMAL} Cleaning up\\n"
-if [ "$CLOUDMIN_INSTALL_TEMPDIR" != "" ] && [ "$CLOUDMIN_INSTALL_TEMPDIR" != "/" ]; then
-  log_debug "Cleaning up temporary files in $CLOUDMIN_INSTALL_TEMPDIR."
-  find "$CLOUDMIN_INSTALL_TEMPDIR" -delete
-else
-  log_error "Could not safely clean up temporary files because TMPDIR set to $CLOUDMIN_INSTALL_TEMPDIR."
-fi
-
-if [ -n "$QUOTA_FAILED" ]; then
-  log_warning "Quotas were not configurable. A reboot may be required. Or, if this is"
-  log_warning "a VM, configuration may be required at the host level."
-fi
-bind_hook "clean_post"
-echo
-if [ $errors -eq "0" ]; then
-  hostname=$(hostname -f)
-  detect_ip
-  if [ "$package_type" = "rpm" ]; then
-    yum_check_skipped
-  fi
-  bind_hook "post_install_message"
-  TIME=$(date +%s)
-  echo "$VER=$TIME" > "/etc/webmin/server-manager/installed"
-  echo "$VER=$TIME" > "/etc/webmin/server-manager/installed-auto"
-else
-  log_warning "The following errors occurred during installation:"
-  echo
-  printf "${errorlist}"
-fi
-
-exit 0
+main "$@"
