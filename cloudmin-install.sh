@@ -852,6 +852,8 @@ EOF
   if [ "$manager" = apt-get ]; then
     run_ok 'apt-get -y remove cloudmin-core cloudmin-kvm-stack cloudmin-config webmin-server-manager' \
       'Uninstalling Cloudmin packages' || return $?
+    # Remove the GPL preference created by the repository setup helper.
+    rm -f "/etc/apt/preferences.d/$ID-cloudmin-package-priority" || return $?
   else
     # Keep hypervisor packages and other dependencies that DNF might remove.
     run_ok 'dnf -y --setopt=clean_requirements_on_remove=False remove cloudmin-config webmin-server-manager' \
