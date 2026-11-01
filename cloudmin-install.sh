@@ -841,6 +841,7 @@ post_install_message() {
   log_success "Installation Complete!"
   log_success "Cloudmin is ready at https://${forcehostname:-$(hostname -f)}:10000."
   log_warning "Your browser may show a certificate warning on the first visit."
+  printf '\n'
 }
 
 # load_module() Sources the selected local module before configuration.
