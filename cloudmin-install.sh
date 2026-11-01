@@ -579,8 +579,7 @@ install_msg() {
 Welcome to the ${ORANGE}${BOLD}Cloudmin $PRODUCT${NORMAL} installer, version ${ORANGE}${BOLD}$VER${NORMAL}
 
   Run this installer on a fresh, supported operating system. To update
-  an existing installation, use your package manager. To change licenses,
-  use System → Settings → License Manager in Cloudmin.
+  an existing installation, use your package manager.
 
 EOF
   # Show supported releases before the disk, swap and bundle summary.
@@ -597,6 +596,7 @@ EOF
   fi
   # Link to the full compatibility requirements before asking to proceed.
   cat <<EOF
+
   Installation ${BOLD}${RED}will fail${NORMAL} if your OS version or architecture is not listed.
   See the full system requirements:
 
@@ -757,7 +757,6 @@ already_installed_block() {
   log_error "Cloudmin is already installed on this system."
   log_error "This installer is intended for a fresh, supported operating system."
   log_error "Use your package manager for updates."
-  log_error "Change licenses in System → Settings → License Manager."
   log_error "Use --force-reinstall only if you intend to rerun installation."
   exit 100
 }
@@ -772,9 +771,6 @@ already_installed_msg() {
 
   Cloudmin is already installed. ${BOLD}${RED}Do not reinstall${NORMAL} to fix problems,
   apply updates or change licenses.
-
-  Use your package manager for updates.
-  Change licenses in System → Settings → License Manager.
 
 EOF
     confirm ' Continue? (y/n) ' || exit 0
