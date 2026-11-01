@@ -74,13 +74,14 @@ def main():
     library = opt.slib.resolve()
     source = installer.read_text()
     functions = source.rsplit('\nmain "$@"', 1)[0]
-    with tempfile.TemporaryDirectory(prefix='cloudmin-installer-ui-') as directory:
+    # Exercise quoted script and log paths through the shared progress helpers.
+    with tempfile.TemporaryDirectory(prefix='cloudmin installer-ui-') as directory:
         root = Path(directory)
         script = root / 'cloudmin-install.sh'
         script.write_text(source)
         (root / 'functions.sh').write_text(functions)
         shutil.copyfile(library, root / 'slib.sh')
-        env = dict(os.environ, TERM='xterm-256color', NO_COLOR='', NONINTERACTIVE='0')
+        env = dict(os.environ, TERM='xterm-256color', NO_COLOR='', NONINTERACTIVE='0', SERIAL='GPL', KEY='GPL')
         for key in ['PS1', 'TMUX', 'STY', 'ZELLIJ', 'OLDTERM', 'TERM_PROGRAM']:
             env.pop(key, None)
         # Exercise the actual graphics output and its text-only fallbacks.
@@ -116,9 +117,14 @@ def main():
         (bin_dir / 'cloudmin-config-system').chmod(0o700)
         wrapper = root / 'wrapper.sh'
         wrapper.write_text('. ' + shlex.quote(str(root / 'functions.sh')) + r'''
-preflight() { ID=rocky; PRETTY_NAME=fixture; manager=${TEST_MANAGER:-dnf}; }
+pre_check_all() { ID=rocky; PRETTY_NAME=fixture; manager=${TEST_MANAGER:-dnf}; }
 is_installed() { return 1; }
-repositories() { run 'Fixture repository setup' printf REPOSITORIES; }
+cloudmin_license_file="$(dirname -- "$0")/license"
+preconfigure_cloudmin_release() {
+  install="$manager -y install"; upgrade="$manager -y upgrade"
+  case "$manager" in apt-get) package_type=deb ;; *) package_type=rpm ;; esac
+}
+manage_cloudmin_branch_repos() { run_ok 'printf REPOSITORIES' 'Fixture repository setup'; }
 hook__phase4_post() { echo phase4_post >>"$TEST_EVENTS"; }
 hook__phases_all_post() { echo phases_all_post >>"$TEST_EVENTS"; }
 hook__clean_post() { echo clean_post >>"$TEST_EVENTS"; }
@@ -157,7 +163,7 @@ main "$@"
         # A real installed host must require -fr, then permit the normal banner.
         if Path('/etc/webmin/server-manager/config').exists():
             result = subprocess.run(['sh', str(script)], env=env, text=True, capture_output=True, timeout=30)
-            require(result.returncode != 0 and 'already has a successful Cloudmin installation' in result.stderr,
+            require(result.returncode != 0 and 'Cloudmin is already installed on this system' in result.stderr,
                     'installed host refuses an accidental reinstall')
             status, output = terminal(['sh', str(script), '-fr', '--no-swap', '--log-dir', str(root)], env,
                                       answer='n\n', prompt='Continue? (y/n)')
