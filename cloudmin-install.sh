@@ -784,6 +784,9 @@ install_with_apt() {
   if [ -z "$noupdates" ]; then
     run_ok "$upgrade" 'Checking and installing system package updates' || return $?
   fi
+  # Purge competing firewall packages before installing the stack.
+  apt-get --quiet --assume-yes purge ufw firewalld >> "$RUN_LOG" 2>&1
+
   extra_packages_cmd=''
   # Check extras before installing Webmin so unavailable names fail early.
   if [ -n "$extra_packages" ]; then
@@ -812,6 +815,9 @@ install_with_yum() {
   if [ -z "$noupdates" ]; then
     run_ok "$upgrade" 'Checking and installing system package updates' || return $?
   fi
+  # Remove firewalld before installing the nftables-based stack.
+  $install_cmd -y remove firewalld >> "$RUN_LOG" 2>&1
+
   # Resolve both groups and optional packages in one dependency transaction.
   run_ok "$install @cloudmincore @cloudmin-kvm 'cloudmin-config >= 10.0.0' 'webmin >= 2.670' $extra_packages" \
     'Installing Cloudmin and the KVM stack' || return $?

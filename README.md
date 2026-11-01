@@ -52,6 +52,8 @@ Ubuntu universe is enabled for the Perl virtualization bindings. Dependencies
 for the core and KVM stack are installed together. On Debian and Ubuntu,
 Webmin is installed and configured first, before its modules run their
 pre-install checks. Failures stop the installer.
+Before installing the stack, APT purges `ufw` and `firewalld`; DNF removes
+`firewalld`. Removal output goes to the installation log.
 Etckeeper is installed for configuration history. BIND and Postfix are not
 installed or configured; additional services can be managed through Webmin.
 

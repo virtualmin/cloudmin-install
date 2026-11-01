@@ -121,7 +121,7 @@ pre_check_all() { ID=rocky; PRETTY_NAME=fixture; manager=${TEST_MANAGER:-dnf}; }
 is_installed() { return 1; }
 cloudmin_license_file="$(dirname -- "$0")/license"
 preconfigure_cloudmin_release() {
-  install="$manager -y install"; upgrade="$manager -y upgrade"
+  install_cmd=$manager; install="$manager -y install"; upgrade="$manager -y upgrade"
   case "$manager" in apt-get) package_type=deb ;; *) package_type=rpm ;; esac
 }
 manage_cloudmin_branch_repos() { run_ok 'printf REPOSITORIES' 'Fixture repository setup'; }

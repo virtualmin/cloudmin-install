@@ -17,7 +17,7 @@ install_msg() { echo "BANNER $PRODUCT"; }
 unstable_repos_system_msg() { :; }
 preconfigured_system_msg() { :; }
 download_slib() {
-  LOG_PATH=$log
+  LOG_PATH=$log; RUN_LOG=$log
   log_debug() { :; }
   serial_ok() { printf '%s\n' "$1" "$2" > "$cloudmin_license_file.checked"; }
   log_info() { echo "[INFO] $1"; echo "[INFO] $1" >> "$LOG_PATH"; }
@@ -48,9 +48,27 @@ class InstallerTests(unittest.TestCase):
     def shell(self, code, *args, env=None):
         environment = dict(os.environ, SERIAL='GPL', KEY='GPL')
         environment.update(env or {})
-        return subprocess.run(['sh', '-c', FUNCTIONS + '\n' + code, 'test', *args],
-                              env=environment,
-                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Direct firewall removal commands must never reach the real package manager.
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            root = pathlib.Path(directory)
+            for manager in ['apt-get', 'dnf']:
+                tool = root / manager
+                tool.write_text(r'''#!/bin/sh
+case "${0##*/}:$*" in
+  'apt-get:--quiet --assume-yes purge ufw firewalld'|'dnf:-y remove firewalld') ;;
+  *) echo 'Unexpected package-manager call' >&2; exit 93 ;;
+esac
+[ -z "$TEST_PACKAGE_EVENTS" ] || printf 'REMOVE %s %s\n' "${0##*/}" "$*" >> "$TEST_PACKAGE_EVENTS"
+printf 'Firewall removal output\n'
+printf 'Firewall removal diagnostic\n' >&2
+exit "${TEST_REMOVE_STATUS:-0}"
+''')
+                tool.chmod(0o700)
+            environment['PATH'] = str(root) + os.pathsep + environment['PATH']
+            environment['RUN_LOG'] = (env or {}).get('RUN_LOG', str(root / 'install.log'))
+            return subprocess.run(['sh', '-c', FUNCTIONS + '\n' + code, 'test', *args],
+                                  env=environment,
+                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def test_sizes(self):
         for value, expected in [('0',0), ('0008',8192), ('1K',1024), ('2MB',2048), ('2G',2097152), ('1gb',1048576)]:
@@ -121,13 +139,54 @@ unstable_repos_system_msg
         # Package errors must survive run_ok and the format dispatcher.
         for kind in ['rpm', 'deb']:
             result = self.shell(r'''
-package_type=$1; noupdates=1; install=false; extra_packages=
+package_type=$1; noupdates=1; install=false; install_cmd=dnf; extra_packages=
 run_ok() { eval "$1"; }
 install_cloudmin || exit $?
 echo FALSE_SUCCESS
 ''', kind)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn('FALSE_SUCCESS', result.stdout)
+
+    def test_firewall_package_removal(self):
+        # Remove competing packages after updates and before the stack; log all
+        # output and continue if removal fails, as with absent packages.
+        for kind in ['deb', 'rpm']:
+            for removal_status, skip_updates, upgrade_failure in [(0, '', False), (100, '', False),
+                                                                  (0, '1', False), (0, '', True)]:
+                with self.subTest(kind=kind, removal_status=removal_status,
+                                  skip_updates=skip_updates, upgrade_failure=upgrade_failure), \
+                        tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                    root = pathlib.Path(directory)
+                    events = root / 'events'
+                    log = root / 'install.log'
+                    result = self.shell(HARNESS + r"""
+package_type=$1; noupdates=$2; install_cmd=dnf; install='fixture install'; upgrade='fixture upgrade'
+run_ok() {
+  printf 'STEP %s\n' "$2" >> "$TEST_PACKAGE_EVENTS"
+  [ "$TEST_FAIL:$2" != 'upgrade:Checking and installing system package updates' ]
+}
+install_cloudmin
+""", directory, 'upgrade' if upgrade_failure else '', 'dnf', kind, skip_updates,
+                        env=dict(TEST_PACKAGE_EVENTS=str(events), TEST_REMOVE_STATUS=str(removal_status),
+                                 RUN_LOG=str(log)))
+                    self.assertEqual(result.returncode == 0, not upgrade_failure, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertEqual(result.stderr, '')
+                    steps = events.read_text().splitlines()
+                    upgrade = 'STEP Checking and installing system package updates'
+                    if upgrade_failure:
+                        self.assertEqual(steps, [upgrade])
+                        self.assertFalse(log.exists())
+                    else:
+                        removal = ('apt-get --quiet --assume-yes purge ufw firewalld' if kind == 'deb'
+                                   else 'dnf -y remove firewalld')
+                        self.assertEqual(steps, ([] if skip_updates else [upgrade]) + [
+                            'REMOVE ' + removal,
+                            'STEP Installing Cloudmin and the KVM stack',
+                            'STEP Checking the configuration package version',
+                            'STEP Checking the Webmin version'])
+                        self.assertIn('Firewall removal output', log.read_text())
+                        self.assertIn('Firewall removal diagnostic', log.read_text())
 
     def test_webmin_configured_before_modules(self):
         # Model dpkg's unpack/configure boundary: the module preinst needs a
