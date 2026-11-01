@@ -685,21 +685,23 @@ EOF
   fi
 }
 
-# preconfigured_system_msg() Warns about software that may conflict with setup.
+# preconfigured_system_msg() Warns before changing existing host services.
 preconfigured_system_msg() {
-  # Detect service tools that suggest this is not a fresh operating system.
+  # Check only services and firewall rules affected by Cloudmin setup.
   is_preconfigured_rs=$(is_preconfigured)
-  # Warn when a detected tool suggests services may already be configured.
+  # Explain the changes before asking to continue on a configured host.
   if [ -n "$is_preconfigured_rs" ]; then
     cat <<EOF
 
   ${WHITEBG}${RED}${BOLD} ATTENTION ${NORMAL}
 
-  Pre-installed software detected: $is_preconfigured_rs
+  Existing host software detected: $is_preconfigured_rs
 
-  The installer expects a ${BOLD}${RED}fresh operating system${NORMAL}. Existing services
-  may conflict with its configuration. Add third-party repositories
-  only after installation, and check their compatibility first.
+  The default setup configures libvirt, Webmin and Fail2ban. It removes
+  conflicting firewall packages and disables other firewall managers
+  before applying Cloudmin's nftables rules. SSH, Webmin and guest networking
+  are allowed. Other incoming connections may be blocked. Review custom
+  firewall rules before continuing.
 
 EOF
     # --yes accepts the warning; interactive users choose whether to proceed.
@@ -712,32 +714,33 @@ EOF
   fi
 }
 
-# is_preconfigured() Prints detected service tools for the pre-install warning.
+# is_preconfigured() Lists existing services and rules affected by setup.
 is_preconfigured() {
   preconfigured=""
-  # BIND suggests the host may already provide DNS service.
-  if named -v 1>/dev/null 2>&1; then
-    preconfigured="${preconfigured}${YELLOW}${BOLD}BIND${NORMAL} "
+  # Include stopped and masked services without starting any daemons.
+  preconfigured_units=$(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null)
+  # Both libvirt layouts share the network and storage configuration we use.
+  if printf '%s\n' "$preconfigured_units" | grep -Eq '^(libvirtd|virtqemud|virtnetworkd|virtstoraged)\.service[[:space:]]'; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}libvirt${NORMAL} "
   fi
-  # Apache can indicate an existing web hosting stack.
-  if apachectl -v 1>/dev/null 2>&1; then
-    preconfigured="${preconfigured}${YELLOW}${BOLD}Apache${NORMAL} "
+  # Webmin receives Cloudmin settings even when it is already installed.
+  if printf '%s\n' "$preconfigured_units" | grep -q '^webmin\.service[[:space:]]'; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}Webmin${NORMAL} "
   fi
-  # Check Nginx independently because both web servers may be installed.
-  if nginx -v 1>/dev/null 2>&1; then
-    preconfigured="${preconfigured}${YELLOW}${BOLD}Nginx${NORMAL} "
+  # Rules may exist without an installed or enabled nftables service.
+  if printf '%s\n' "$preconfigured_units" | grep -q '^nftables\.service[[:space:]]' ||
+      nft list tables 2>/dev/null | grep -q '^table '; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}nftables${NORMAL} "
   fi
-  # The MariaDB client is a signal of pre-installed database software.
-  if command -pv mariadb 1>/dev/null 2>&1; then
-    preconfigured="${preconfigured}${YELLOW}${BOLD}MariaDB${NORMAL} "
-  fi
-  # Postfix can indicate an existing mail service configuration.
-  if postconf mail_version 1>/dev/null 2>&1; then
-    preconfigured="${preconfigured}${YELLOW}${BOLD}Postfix${NORMAL} "
-  fi
-  # PHP is another sign that the host may already run web applications.
-  if php -v 1>/dev/null 2>&1; then
-    preconfigured="${preconfigured}${YELLOW}${BOLD}PHP${NORMAL} "
+  # Cloudmin stops these firewall managers before applying its own profile.
+  for preconfigured_service in firewalld ufw iptables ip6tables netfilter-persistent; do
+    if printf '%s\n' "$preconfigured_units" | grep -q "^${preconfigured_service}\\.service[[:space:]]"; then
+      preconfigured="${preconfigured}${YELLOW}${BOLD}${preconfigured_service}${NORMAL} "
+    fi
+  done
+  # Existing Fail2ban jails are validated when Cloudmin adds its host jails.
+  if printf '%s\n' "$preconfigured_units" | grep -q '^fail2ban\.service[[:space:]]'; then
+    preconfigured="${preconfigured}${YELLOW}${BOLD}Fail2ban${NORMAL} "
   fi
   # Return a comma-separated display list to the warning caller.
   preconfigured=$(echo "$preconfigured" | sed 's/ /, /g' | sed 's/, $/ /')
@@ -1100,7 +1103,7 @@ main() {
     if [ -z "$skipbanner" ]; then
       bind_hook install_msg || fatal 'Cannot display installation summary'
       bind_hook unstable_repos_system_msg || fatal 'Cannot display repository warning'
-      bind_hook preconfigured_system_msg || fatal 'Cannot check pre-installed software'
+      bind_hook preconfigured_system_msg || fatal 'Cannot check existing host services'
       bind_hook already_installed_msg || fatal 'Cannot check existing installation'
     fi
   fi

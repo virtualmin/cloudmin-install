@@ -102,6 +102,11 @@ The installer shows progress through four installation phases and logs each
 step. `--swap-only` shows a swap plan for confirmation and exits before any
 repository, package or service changes.
 
+The pre-install warning checks existing libvirt, Webmin, firewall and Fail2ban
+services, plus active nftables tables. It explains the default firewall changes
+before asking to continue. Web, mail and database software alone does not
+trigger this warning.
+
 Available controls:
 
 - `--force-reinstall|-fr` allows an explicit rerun on an installed host. It does

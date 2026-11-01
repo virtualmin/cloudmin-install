@@ -445,6 +445,79 @@ printf '<%s>\n' $config_includes $config_excludes
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn('ACCEPTED', result.stdout)
 
+    def test_preconfigured_services(self):
+        # CLI tools and unrelated servers alone must not trigger the warning.
+        probe = r"""
+systemctl() {
+  [ "$*" = 'list-unit-files --type=service --no-legend --no-pager' ] || return 90
+  printf '%s\n' "$TEST_UNITS"
+}
+nft() {
+  [ "$*" = 'list tables' ] || return 91
+  printf '%s\n' "$TEST_TABLES"
+  return "$TEST_NFT_STATUS"
+}
+named() { return 0; }
+apachectl() { return 0; }
+nginx() { return 0; }
+mariadb() { return 0; }
+postconf() { return 0; }
+php() { return 0; }
+virsh() { echo UNEXPECTED_LIBVIRT_CONNECTION >&2; return 92; }
+YELLOW=; BOLD=; NORMAL=
+is_preconfigured
+"""
+        cases = [
+            ('', '', 127, ''),
+            ('apache2.service enabled\nnginx.service enabled\nnamed.service enabled\n'
+             'mariadb.service enabled\npostfix.service enabled\nphp-fpm.service enabled', '', 0, ''),
+            ('libvirtd.service disabled enabled', '', 0, 'libvirt'),
+            ('virtqemud.service enabled enabled\nvirtnetworkd.service enabled enabled\n'
+             'virtstoraged.service disabled enabled', '', 0, 'libvirt'),
+            ('virtstoraged.service masked enabled', '', 0, 'libvirt'),
+            ('webmin.service enabled enabled', '', 0, 'Webmin'),
+            ('nftables.service disabled disabled', '', 0, 'nftables'),
+            ('', 'table inet custom', 0, 'nftables'),
+            ('nftables.service enabled enabled', 'table inet custom', 0, 'nftables'),
+            ('fail2ban.service disabled enabled', '', 0, 'Fail2ban'),
+            ('webmin-extra.service enabled\nmy-firewalld.service enabled', '', 0, ''),
+            ('libvirtd.service enabled\nwebmin.service enabled\nfirewalld.service enabled\n'
+             'fail2ban.service enabled', 'table inet custom', 0,
+             'libvirt, Webmin, nftables, firewalld, Fail2ban'),
+        ]
+        for service in ['firewalld', 'ufw', 'iptables', 'ip6tables', 'netfilter-persistent']:
+            cases.append((f'{service}.service disabled enabled', '', 0, service))
+        for units, tables, status, expected in cases:
+            with self.subTest(units=units, tables=tables):
+                result = self.shell(probe, env=dict(TEST_UNITS=units, TEST_TABLES=tables,
+                                                   TEST_NFT_STATUS=str(status)))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, '')
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_preconfigured_warning(self):
+        # Keep normal prompting, cancellation and --yes behavior intact.
+        for detected, skip, answer, continues in [('', 0, 1, True),
+                                                  ('libvirt', 0, 0, True),
+                                                  ('firewalld', 0, 1, False),
+                                                  ('Webmin', 1, 1, True)]:
+            with self.subTest(detected=detected, skip=skip, answer=answer):
+                result = self.shell(r"""
+is_preconfigured() { printf '%s\n' "$TEST_DETECTED"; }
+confirm() { printf 'PROMPT %s\n' "$1"; return "$TEST_ANSWER"; }
+skipyesno=$TEST_SKIP
+preconfigured_system_msg
+printf 'CONTINUED\n'
+""", env=dict(TEST_DETECTED=detected, TEST_SKIP=str(skip), TEST_ANSWER=str(answer)))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual('ATTENTION' in result.stdout, bool(detected))
+                self.assertEqual('PROMPT' in result.stdout, bool(detected) and not skip)
+                self.assertEqual('CONTINUED' in result.stdout, continues)
+                if detected:
+                    self.assertIn('Existing host software detected: ' + detected, result.stdout)
+                    self.assertIn('other incoming connections', result.stdout.lower())
+                    self.assertNotIn('third-party repositories', result.stdout)
+
     def test_banner(self):
         p = self.shell(r'''
 PRODUCT=$1; skipyesno=1; noswap=; setup_only=; SLIB_SWAP_API=2; disk_space_required=4; bundle=KVM
