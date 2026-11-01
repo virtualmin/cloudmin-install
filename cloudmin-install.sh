@@ -1097,7 +1097,8 @@ main() {
   printf '\n'
   bind_hook phase Configuration 4 || fatal 'Phase hook failed'
   bind_hook phase4_pre || fatal 'Configuration hook failed'
-  log_info 'Checking KVM appliance boot (3-minute timeout)'
+  # Keep the timeout detail in the log while Config renders the progress row.
+  log_info 'Checking KVM appliance boot (3-minute timeout)' >/dev/null
   # On failure, show recent diagnostics and stop before reporting success.
   # The option helpers accept only literal plugin names.
   # shellcheck disable=SC2086
