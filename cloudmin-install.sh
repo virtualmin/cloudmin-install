@@ -2,7 +2,9 @@
 # Copyright 2005-2026 Cloudmin
 # Copyright 2005-2026 The Webmin Developers
 # Install Cloudmin on a supported Linux host.
-# shellcheck disable=SC1090,SC1091,SC2034,SC2154,SC3043,SC2059
+# shellcheck disable=SC1090,SC1091,SC2034,SC2154,SC2059,SC2016
+
+# Single-quoted run_ok commands expand their variables when executed.
 
 VER=10.0.0-RC1
 
@@ -70,8 +72,8 @@ log_error() {
   fi
 }
 
-# fail(message) Reports errors before and after the shared logger is available.
-fail() {
+# fatal(message, [words...]) Reports an error and exits with status 1.
+fatal() {
   log_error "$*"
   exit 1
 }
@@ -95,8 +97,10 @@ bind_hook() {
   fi
 }
 
-# swap_size(value) Validates a size and converts it to KiB, rounded up to MiB.
+# swap_size(value) Sets swapsize in KiB, rounding up to whole MiB.
+# Bare numbers mean MiB; K/M/G and optional B suffixes are case-insensitive.
 swap_size() {
+  # Separate the leading digits from the unit before doing arithmetic.
   swap_arg=$1
   swap_num=${swap_arg%%[!0-9]*}
   swap_suffix=${swap_arg#"$swap_num"}
@@ -104,101 +108,140 @@ swap_size() {
     [Kk]|[Kk][Bb]) swap_mult=1 ;;
     [Mm]|[Mm][Bb]|'') swap_mult=1024 ;;
     [Gg]|[Gg][Bb]) swap_mult=1048576 ;;
-    *) fail "Invalid swap size: $swap_arg" ;;
+    *) fatal "Invalid swap size: $swap_arg" ;;
   esac
+  # Remove leading zeros so shell arithmetic cannot interpret an octal value.
   swap_num=${swap_num#"${swap_num%%[!0]*}"}
+  # Require digits and reject values too long for the bounded calculation.
   if [ -z "${swap_arg%%[!0-9]*}" ] || [ "${#swap_num}" -gt 10 ]; then
-    fail "Invalid swap size: $swap_arg"
+    fatal "Invalid swap size: $swap_arg"
   fi
+  # Retain zero for removal, bound the size, then round up to whole MiB.
   swap_num=${swap_num:-0}
-  [ "$swap_num" -le $((1073740800 / swap_mult)) ] || fail "Invalid swap size: $swap_arg"
+  [ "$swap_num" -le $((1073740800 / swap_mult)) ] || fatal "Invalid swap size: $swap_arg"
   swapsize=$(((swap_num * swap_mult + 1023) / 1024 * 1024))
 }
 
-# require_value(option, [value]) Rejects missing option values before side effects.
+# require_value(option, [value]) Rejects missing option values.
 require_value() {
-  [ -n "${2:-}" ] || fail "$1 requires a value"
-  case "$2" in -*) fail "$1 requires a value" ;; esac
+  [ -n "${2:-}" ] || fatal "$1 requires a value"
+  case "$2" in -*) fatal "$1 requires a value" ;; esac
 }
 
-# parse_options(args) Validates all options before inspecting or changing the host.
-parse_options() {
-  branch=unstable; setup=; swap_only=; noswap=; swapsize=; skipyesno=0
-  hostname_arg=; no_updates=; extra=; includes=; excludes=; VERBOSE=0
+# add_extra_packages(names) Adds comma-separated package names as quoted tokens.
+add_extra_packages() {
+  printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[a-zA-Z0-9][a-zA-Z0-9+_.-]*(,[a-zA-Z0-9][a-zA-Z0-9+_.-]*)*$' ||
+    fatal 'Invalid extra package list'
+  # Quote each validated name for the command string later evaluated by run_ok.
+  old_ifs=$IFS
+  IFS=,
+  for p in $1; do
+    extra_packages="${extra_packages}${extra_packages:+ }'$p'"
+  done
+  IFS=$old_ifs
+}
+
+# add_config_excludes(names) Adds comma-separated plugins to the exclude list.
+add_config_excludes() {
+  printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[A-Za-z][A-Za-z0-9]*(,[A-Za-z][A-Za-z0-9]*)*$' ||
+    fatal 'Invalid configuration plugin list'
+  # Expand the validated list into separate options for cloudmin-config-system.
+  old_ifs=$IFS
+  IFS=,
+  for x in $1; do
+    config_excludes="${config_excludes} --exclude $x"
+  done
+  IFS=$old_ifs
+}
+
+# add_config_includes(names) Adds comma-separated plugins to the include list.
+add_config_includes() {
+  printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[A-Za-z][A-Za-z0-9]*(,[A-Za-z][A-Za-z0-9]*)*$' ||
+    fatal 'Invalid configuration plugin list'
+  # Expand the validated list into separate options for cloudmin-config-system.
+  old_ifs=$IFS
+  IFS=,
+  for x in $1; do
+    config_includes="${config_includes} --include $x"
+  done
+  IFS=$old_ifs
+}
+
+# parse_args([args...]) Sets defaults and validates command-line options.
+parse_args() {
+  # Reset modes and option lists before parsing the arguments.
+  branch=unstable; setup_only=; swap_only=; noswap=; swapsize=; skipyesno=0
+  forcehostname=; noupdates=; extra_packages=; config_includes=; config_excludes=; VERBOSE=0
   forcereinstall=; skipbanner=; module_name=; insecure_downloads=; connect=; uninstall_mode=
   bundle=KVM; showversion=
   log_dir=/root
+  # Consume each option once; value-taking options also consume the next word.
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --help|-h) bind_hook usage; exit 0 ;;
       --version|-v) showversion=1; shift ;;
+      # Validate required values before assigning them or expanding lists.
       --branch|-B|--hostname|-n|--extra|-E|--include|-i|--exclude|-e|--log-dir|--swap|-S|--module|-o|--bundle|-b)
         require_value "$1" "${2:-}"
         case "$1" in
           --branch|-B) branch=$2 ;;
-          --hostname|-n) hostname_arg=$2 ;;
-          --extra|-E) extra="${extra:+$extra,}$2" ;;
-          --include|-i) includes="${includes:+$includes,}$2" ;;
-          --exclude|-e) excludes="${excludes:+$excludes,}$2" ;;
+          --hostname|-n) forcehostname=$2 ;;
+          --extra|-E) add_extra_packages "$2" ;;
+          --include|-i) add_config_includes "$2" ;;
+          --exclude|-e) add_config_excludes "$2" ;;
           --log-dir) log_dir=$2 ;;
           --swap|-S) swap_size "$2" ;;
           --module|-o) module_name=$2 ;;
           --bundle|-b) bundle=$2 ;;
         esac
         shift 2 ;;
-      --setup|-s) setup=1; shift ;;
+      # Collect flags here; check for conflicting options below.
+      --setup|-s) setup_only=1; shift ;;
       --swap-only) swap_only=1; shift ;;
       --no-swap|-ns) noswap=1; shift ;;
       --yes|-y|--force|-f) skipyesno=1; shift ;;
-      --no-package-updates|-x) no_updates=1; shift ;;
+      --no-package-updates|-x) noupdates=1; shift ;;
       --verbose|-V) VERBOSE=1; shift ;;
       --force-reinstall|-fr) forcereinstall=1; shift ;;
       --no-banner|-nb) skipbanner=1; shift ;;
       --insecure-downloads|-I) insecure_downloads=1; shift ;;
       --uninstall|-u) uninstall_mode=1; shift ;;
+      # Without an explicit family, test both IPv4 and IPv6.
       --connect|-C)
         connect='ipv4 ipv6'; shift
         case "${1:-}" in
           ipv4|ipv6) connect=$1; shift ;;
           ''|-*) ;;
-          *) fail "Invalid protocol: $1" ;;
+          *) fatal "Invalid protocol: $1" ;;
         esac ;;
-      *) fail "Unknown option: $1" ;;
+      *) fatal "Unknown option: $1" ;;
     esac
   done
+  # Map development aliases to the only published branch.
   case "$branch" in testing|development|devel|dev|nightly|bleeding-edge|cutting-edge) branch=unstable ;; esac
-  [ "$branch" = unstable ] || fail 'Only the unstable repository is available'
-  [ "$bundle" = KVM ] || fail "Unknown bundle: $bundle"
-  case "$module_name" in *[!A-Za-z0-9_.-]*|.*) fail 'Invalid module name' ;; esac
-  [ -z "$uninstall_mode" ] || [ -z "$setup$swap_only$swapsize$noswap$connect$hostname_arg$extra$includes$excludes$module_name" ] ||
-    fail '--uninstall cannot be combined with setup, swap or installation options'
-  [ -z "$connect" ] || [ -z "$setup$swap_only$swapsize$noswap$uninstall_mode$hostname_arg$extra$includes$excludes$module_name" ] ||
-    fail '--connect cannot be combined with setup, swap or installation options'
-  [ -z "$noswap" ] || [ -z "$swapsize" ] || fail 'Options --swap and --no-swap are mutually exclusive'
-  [ -z "$setup" ] || [ -z "$swap_only$swapsize" ] || fail '--setup cannot be combined with swap changes'
-  [ -z "$setup" ] || [ -z "$hostname_arg$extra$includes$excludes$no_updates$module_name" ] ||
-    fail '--setup cannot be combined with installation options'
-  [ -z "$swap_only" ] || [ -z "$hostname_arg$extra$includes$excludes$no_updates$module_name" ] ||
-    fail '--swap-only cannot be combined with installation options'
-  case "$log_dir" in /*) ;; *) fail '--log-dir must be an absolute path' ;; esac
-  if [ -n "$hostname_arg" ]; then
-    printf '%s\n' "$hostname_arg" | LC_ALL=C grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$' ||
-      fail 'Provide a fully qualified host name'
+  [ "$branch" = unstable ] || fatal 'Only the unstable repository is available'
+  [ "$bundle" = KVM ] || fatal "Unknown bundle: $bundle"
+  # Modules are local script names, not paths or shell expressions.
+  case "$module_name" in *[!A-Za-z0-9_.-]*|.*) fatal 'Invalid module name' ;; esac
+  # Standalone uninstall and connectivity checks cannot perform install actions.
+  [ -z "$uninstall_mode" ] || [ -z "$setup_only$swap_only$swapsize$noswap$connect$forcehostname$extra_packages$config_includes$config_excludes$module_name" ] ||
+    fatal '--uninstall cannot be combined with setup, swap or installation options'
+  [ -z "$connect" ] || [ -z "$setup_only$swap_only$swapsize$noswap$uninstall_mode$forcehostname$extra_packages$config_includes$config_excludes$module_name" ] ||
+    fatal '--connect cannot be combined with setup, swap or installation options'
+  # Reject swap and installation options that conflict with the chosen mode.
+  [ -z "$noswap" ] || [ -z "$swapsize" ] || fatal '--swap and --no-swap cannot be used together'
+  [ -z "$setup_only" ] || [ -z "$swap_only$swapsize" ] || fatal '--setup cannot be combined with swap changes'
+  [ -z "$setup_only" ] || [ -z "$forcehostname$extra_packages$config_includes$config_excludes$noupdates$module_name" ] ||
+    fatal '--setup cannot be combined with installation options'
+  [ -z "$swap_only" ] || [ -z "$forcehostname$extra_packages$config_includes$config_excludes$noupdates$module_name" ] ||
+    fatal '--swap-only cannot be combined with installation options'
+  # Absolute paths keep logs accessible after changing directories.
+  case "$log_dir" in /*) ;; *) fatal '--log-dir must be an absolute path' ;; esac
+  # Validate a requested host name before passing it to hostnamectl.
+  if [ -n "$forcehostname" ]; then
+    printf '%s\n' "$forcehostname" | LC_ALL=C grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$' ||
+      fatal 'Provide a fully qualified host name'
   fi
-  # Only literal package and plugin names reach the package manager or the configuration tool.
-  if [ -n "$extra" ]; then
-    printf '%s\n' "$extra" | LC_ALL=C grep -Eq '^[a-zA-Z0-9][a-zA-Z0-9+_.-]*(,[a-zA-Z0-9][a-zA-Z0-9+_.-]*)*$' ||
-      fail 'Invalid extra package list'
-  fi
-  for names in "$includes" "$excludes"; do
-    [ -z "$names" ] || printf '%s\n' "$names" | LC_ALL=C grep -Eq '^[A-Za-z][A-Za-z0-9]*(,[A-Za-z][A-Za-z0-9]*)*$' ||
-      fail 'Invalid configuration plugin list'
-  done
-}
-
-# parse_args(args...) Parses options and selects the utility library host.
-parse_args() {
-  parse_options "$@"
   # Select the utility library from the same branch as the Cloudmin packages.
   if [ "$branch" = unstable ]; then
     download_cloudmin_host_lib="$download_cloudmin_host_dev"
@@ -222,27 +265,31 @@ supported_host() {
   esac
 }
 
-# preflight() Rejects unsupported systems before downloads, swap or package changes.
-preflight() {
-  [ "$(uname -s)" = Linux ] || fail 'Run this installer on a Linux host'
-  [ "$(id -u)" = 0 ] || fail 'Run this installer as root'
+# pre_check_all() Checks host requirements for the selected operation.
+pre_check_all() {
+  # Every operation reaching preflight needs Linux and root privileges.
+  [ "$(uname -s)" = Linux ] || fatal 'Run this installer on a Linux host'
+  [ "$(id -u)" = 0 ] || fatal 'Run this installer as root'
   # Standalone swap management does not configure a Cloudmin host.
   [ -z "$swap_only" ] || return 0
-  [ -r /etc/os-release ] || fail 'Cannot determine the operating system'
+  # Repository and package operations require a supported OS and systemd.
+  [ -r /etc/os-release ] || fatal 'Cannot determine the operating system'
   . /etc/os-release
   supported_host "${ID:-}" "${VERSION_ID:-}" "$(uname -m)" ||
-    fail 'Supported hosts: Rocky/AlmaLinux 10, Debian 13 and Ubuntu 26.04, x86_64 or aarch64'
-  [ -d /run/systemd/system ] || fail 'A running systemd host is required'
-  [ -n "$setup$uninstall_mode" ] || [ -c /dev/kvm ] || fail 'KVM is unavailable; enable hardware or nested virtualization'
-  if [ -z "$setup$uninstall_mode$forcereinstall" ] && is_installed; then
+    fatal 'Supported hosts: AlmaLinux 10, Rocky Linux 10, Debian 13 or Ubuntu 26.04 on x86_64 or aarch64'
+  [ -d /run/systemd/system ] || fatal 'A running systemd host is required'
+  [ -n "$setup_only$uninstall_mode" ] || [ -c /dev/kvm ] || fatal 'KVM is unavailable; enable hardware or nested virtualization'
+  # Require an explicit reinstall flag when the module is already configured.
+  if [ -z "$setup_only$uninstall_mode$forcereinstall" ] && is_installed; then
     bind_hook already_installed_block
     return 1
   fi
+  # Select the native package manager and suppress Debian package prompts.
   case "$ID" in
     debian|ubuntu) manager=apt-get; export DEBIAN_FRONTEND=noninteractive ;;
     *) manager=dnf ;;
   esac
-  command -v "$manager" >/dev/null 2>&1 || fail "$manager is required"
+  command -v "$manager" >/dev/null 2>&1 || fatal "$manager is required"
 }
 
 # finish() Removes only this invocation's private workspace and keeps its exit status.
@@ -259,62 +306,57 @@ finish() {
   exit "$result"
 }
 
-# fetch(url, path) Requires HTTPS and stops on HTTP or download failure.
-fetch() {
+# download_content(url) Writes an HTTPS response to stdout.
+download_content() {
+  # Prefer curl and restrict both the request and redirects to HTTPS.
   if command -v curl >/dev/null 2>&1; then
     curl -q ${insecure_downloads:+--insecure} --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
-      --connect-timeout 20 --max-time 300 --output "$2" "$1" >>"$log" 2>&1 || fail "Download failed: $1"
+      --connect-timeout 20 --max-time 300 "$1" 2>>"$log"
   elif command -v wget >/dev/null 2>&1; then
-    wget ${insecure_downloads:+--no-check-certificate} --https-only --timeout=30 --tries=2 -q -O "$2" "$1" >>"$log" 2>&1 || fail "Download failed: $1"
+    # Use wget when curl is absent, with bounded retries and HTTPS only.
+    wget ${insecure_downloads:+--no-check-certificate} --https-only --timeout=30 --tries=2 -q -O - "$1" 2>>"$log"
   else
-    fail 'Install curl or wget, or place slib.sh beside the installer for --swap-only'
+    # Standalone swap can use a local slib.sh without downloading anything.
+    log_error 'Install curl or wget, or place slib.sh beside the installer for --swap-only'
+    return 1
   fi
 }
 
-# run(message, command...) Preserves the command's failure and keeps detailed output.
-run() {
-  local message="$1" command_text='' arg
-  shift
-  # run_ok accepts shell text; quote each argument before passing it through.
-  for arg do
-    arg=$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")
-    command_text="$command_text '$arg'"
-  done
-  # slib's command log path must have no spaces; merge it into the main log.
-  local RUN_LOG result
-  RUN_LOG=$(mktemp "$CLOUDMIN_INSTALL_TEMPDIR/command.XXXXXX") || fail 'Cannot create command log'
-  run_ok "$command_text" "$message"
-  result=$?
-  cat "$RUN_LOG" >>"$log"
-  rm -f "$RUN_LOG"
-  [ "$result" -eq 0 ] || fail "$message failed; see $log"
+# goto_tmpdir() Keeps library probes and progress files in this run's workspace.
+goto_tmpdir() {
+  cd "$CLOUDMIN_INSTALL_TEMPDIR" || fatal 'Cannot enter temporary directory'
 }
 
-# load_slib() Loads logging, prompts, progress and swap helpers.
-load_slib() {
+# download_slib() Loads logging, prompts, progress and swap helpers.
+download_slib() {
+  # Prefer a trusted library supplied beside the installer.
   if [ -f "$script_dir/slib.sh" ]; then
     library="$script_dir/slib.sh"
   else
+    # Otherwise fetch the library from the selected download branch.
     library="$CLOUDMIN_INSTALL_TEMPDIR/slib.sh"
-    fetch "https://$download_cloudmin_host_lib/slib.sh" "$library"
+    download_content "https://$download_cloudmin_host_lib/slib.sh" > "$library" ||
+      fatal 'Failed to download the utility library'
   fi
-  # The shared logger initializes terminal colors even for unattended runs.
+  # Provide a fallback TERM for the shared terminal capability checks.
   TERM=${TERM:-dumb}; export TERM
   # slib writes terminal probes and spinner state in the current directory.
-  cd "$CLOUDMIN_INSTALL_TEMPDIR" || fail 'Cannot enter temporary directory'
+  goto_tmpdir
   . "$library"
+  # Send logger and command output to one log; callers handle command failures.
   LOG_PATH=$log; RUN_LOG=$log; LOG_LEVEL_LOG=DEBUG
   RUN_ERRORS_FATAL=
   SPINNER_DONEFILE="$CLOUDMIN_INSTALL_TEMPDIR/stopspinning"
   LOG_LEVEL_STDOUT=INFO
   [ "$VERBOSE" != 1 ] || LOG_LEVEL_STDOUT=DEBUG
-  # The shared library has terminal cleanup traps; own our task directory here.
+  # Replace slib traps to clean up both the terminal and our workspace.
   trap finish EXIT
   trap 'exit 130' INT
   trap 'exit 143' HUP TERM
   trap 'exit 131' QUIT
-  if [ -z "$noswap$setup$uninstall_mode" ] && [ "${SLIB_SWAP_API:-0}" != 2 ]; then
-    fail 'The loaded utility library does not support swap management. Update slib.sh.'
+  # Require the managed-swap API only when this run may change swap.
+  if [ -z "$noswap$setup_only$uninstall_mode" ] && [ "${SLIB_SWAP_API:-0}" != 2 ]; then
+    fatal 'This version of slib.sh does not support swap management. Update slib.sh.'
   fi
 }
 
@@ -326,68 +368,64 @@ swap_abort() {
   exit 1
 }
 
-# confirm(prompt) Uses the shared yes/no prompt and restores terminal echo.
+# confirm(prompt) Returns success for --yes or an accepted yes/no prompt.
 confirm() {
+  # Unattended callers must opt into confirmation instead of waiting on stdin.
   [ "$skipyesno" = 1 ] && return 0
-  [ -t 0 ] || fail 'Use --yes for unattended installation'
+  [ -t 0 ] || fatal 'Use --yes for unattended installation'
   printf '%s' "$1"
   yesno
-  local result=$?
+  # The prompt may disable echo; restore it without losing the answer status.
+  confirm_result=$?
   stty echo 2>/dev/null || :
-  return "$result"
+  return "$confirm_result"
 }
 
-# repositories() Uses the current shared Webmin repository bootstrap and group IDs.
-repositories() {
+# preconfigure_cloudmin_release() Prepares the distribution's package manager.
+preconfigure_cloudmin_release() {
+  # APT keeps existing configuration and installs only required dependencies.
   if [ "$manager" = apt-get ]; then
-    run 'Refreshing distribution metadata' apt-get update
-    run 'Installing repository prerequisites' apt-get -y install ca-certificates curl gnupg
+    package_type=deb
+    install="apt-get --quiet --assume-yes --no-install-recommends -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' install"
+    upgrade="${install% install} upgrade"
+    run_ok 'apt-get update' 'Refreshing distribution metadata' || return $?
+    run_ok "$install ca-certificates curl gnupg" 'Installing repository prerequisites' || return $?
+    # Ubuntu provides required virtualization bindings through universe.
     if [ "$ID" = ubuntu ]; then
-      run 'Installing repository tools' apt-get -y install software-properties-common
-      run 'Enabling Ubuntu universe' add-apt-repository -y universe
+      run_ok "$install software-properties-common" 'Installing repository tools' || return $?
+      run_ok 'add-apt-repository -y universe' 'Enabling Ubuntu universe' || return $?
     fi
   else
+    # DNF must fail on missing packages and omit optional weak dependencies.
+    package_type=rpm
+    install_cmd=dnf
+    install="$install_cmd -y --setopt=strict=1 --setopt=install_weak_deps=False --setopt=optional_metadata_types=filelists install"
+    upgrade="$install_cmd -y upgrade"
     # Existing curl-minimal is sufficient; do not force replacement with curl.
     if ! command -v curl >/dev/null 2>&1; then
-      run 'Installing the repository HTTP client' dnf -y install curl
+      run_ok "$install curl" 'Installing the repository HTTP client' || return $?
     fi
-    run 'Installing repository prerequisites' dnf -y install ca-certificates dnf-plugins-core
-    run 'Enabling CRB' dnf config-manager --set-enabled crb
-    run 'Installing EPEL configuration' dnf -y install epel-release
-  fi
-  bootstrap="$CLOUDMIN_INSTALL_TEMPDIR/setup-repo.sh"
-  fetch 'https://raw.githubusercontent.com/webmin/webmin/master/webmin-setup-repo.sh' "$bootstrap"
-  run 'Configuring Webmin repository' sh "$bootstrap" --force "--$branch" \
-    "--host=$download_webmin_host" "--unstable-host=$download_webmin_host_dev"
-  # Stable Webmin supplies the signing key; Cloudmin uses its own repository name.
-  run 'Configuring Cloudmin repository' sh "$bootstrap" --force "--$branch" \
-    --name=cloudmin --dist=cloudmin --description=Cloudmin --component=main \
-    "--host=$download_cloudmin_host" "--unstable-host=$download_cloudmin_host_dev" \
-    "--key-server=https://$download_webmin_host" \
-    --check-binary=0 --install-packages=cloudmin-config
-  if [ "$manager" = apt-get ]; then
-    run 'Refreshing package metadata' apt-get update
-  else
-    run 'Refreshing package metadata' dnf -y makecache --refresh
+    # CRB and EPEL supply additional host and Perl dependencies on EL systems.
+    run_ok "$install ca-certificates dnf-plugins-core" 'Installing repository prerequisites' || return $?
+    run_ok "$install_cmd config-manager --set-enabled crb" 'Enabling CRB' || return $?
+    run_ok "$install epel-release" 'Installing EPEL configuration' || return $?
   fi
 }
 
-# configure() Passes validated plugin lists as arguments, without evaluating shell text.
-configure() {
-  set -- --bundle KVM --log "$log"
-  if [ -n "$includes" ]; then
-    set -- "$@" --include
-    for plugin in $(printf '%s' "$includes" | tr ',' ' '); do set -- "$@" "$plugin"; done
-  fi
-  if [ -n "$excludes" ]; then
-    set -- "$@" --exclude
-    for plugin in $(printf '%s' "$excludes" | tr ',' ' '); do set -- "$@" "$plugin"; done
-  fi
-  log_info 'Checking KVM appliance boot (3-minute timeout)'
-  # Show the failed check and its advice as well as retaining the complete log.
-  if ! cloudmin-config-system "$@"; then
-    tail -n 30 "$log" >&2
-    fail "Cloudmin configuration or readiness failed; see $log"
+# manage_cloudmin_branch_repos() Configures the selected branch and edition.
+manage_cloudmin_branch_repos() {
+  bootstrap="$CLOUDMIN_INSTALL_TEMPDIR/install"
+  download_content "https://$download_cloudmin_host_lib/install" > "$bootstrap" || return $?
+  # Preserve download host overrides when the helper starts a new shell.
+  export download_cloudmin_host_dev download_webmin_host download_webmin_host_dev
+  run_ok 'sh "$bootstrap" webmin "$branch"' 'Configuring Webmin repository' || return $?
+  run_ok 'sh "$bootstrap" cloudmin "$branch"' 'Configuring Cloudmin repository' || return $?
+  # Refresh APT indexes after configuring both repositories.
+  if [ "$package_type" = deb ]; then
+    run_ok 'apt-get update' 'Refreshing package metadata' || return $?
+  else
+    # Force DNF to load metadata from the newly configured repositories.
+    run_ok "$install_cmd -y makecache --refresh" 'Refreshing package metadata' || return $?
   fi
 }
 
@@ -529,7 +567,7 @@ EOF
   echo "$supported"
   # Include the optional swap plan in the installation summary below.
   swap_note=""
-  if [ "${SLIB_SWAP_API:-0}" = 2 ] && [ -z "$setup$noswap" ] &&
+  if [ "${SLIB_SWAP_API:-0}" = 2 ] && [ -z "$setup_only$noswap" ] &&
      swap_plan "$disk_space_required"; then
     swap_note=$(swap_plan_message)
   fi
@@ -697,35 +735,63 @@ EOF
   fi
 }
 
-# install_cloudmin() Installs the KVM stack and checks configuration API versions.
+# install_with_apt() Installs the DEB stack and checks required tool versions.
+install_with_apt() {
+  # Apply distribution updates unless the caller explicitly skipped them.
+  if [ -z "$noupdates" ]; then
+    run_ok "$upgrade" 'Checking and installing system package updates' || return $?
+  fi
+  extra_packages_cmd=''
+  # Check extras before installing Webmin so unavailable names fail early.
+  if [ -n "$extra_packages" ]; then
+    sim_install="${install% install} --simulate install"
+    run_ok "$sim_install webmin && $sim_install $extra_packages" \
+      'Checking availability of selected extra packages' || return $?
+    extra_packages_cmd=" && $install $extra_packages"
+  fi
+
+  # Configure Webmin before its modules run their pre-install checks, then
+  # install the core and KVM packages together.
+  run_ok "$install webmin$extra_packages_cmd && $install cloudmin-core cloudmin-kvm-stack" \
+    'Installing Cloudmin and the KVM stack' || return $?
+  # Check minimum package versions before running host configuration.
+  config_version=$(dpkg-query -W -f='${Version}' cloudmin-config) || return $?
+  webmin_version=$(dpkg-query -W -f='${Version}' webmin) || return $?
+  run_ok 'dpkg --compare-versions "$config_version" ge 10.0.0' \
+    'Checking the configuration package version' || return $?
+  run_ok 'dpkg --compare-versions "$webmin_version" ge 2.670' \
+    'Checking the Webmin version' || return $?
+}
+
+# install_with_yum() Installs the RPM groups and checks required tool versions.
+install_with_yum() {
+  # Apply distribution updates unless the caller explicitly skipped them.
+  if [ -z "$noupdates" ]; then
+    run_ok "$upgrade" 'Checking and installing system package updates' || return $?
+  fi
+  # Resolve both groups and optional packages in one dependency transaction.
+  run_ok "$install @cloudmincore @cloudmin-kvm 'cloudmin-config >= 10.0.0' 'webmin >= 2.670' $extra_packages" \
+    'Installing Cloudmin and the KVM stack' || return $?
+  # Confirm the installed packages meet the requested minimum versions.
+  run_ok "rpm -q --whatprovides 'cloudmin-config >= 10.0.0'" \
+    'Checking the configuration package version' || return $?
+  run_ok "rpm -q --whatprovides 'webmin >= 2.670'" \
+    'Checking the Webmin version' || return $?
+}
+
+# install_cloudmin() Selects the installation routine for the package format.
 install_cloudmin() {
-  [ -n "$no_updates" ] || run 'Checking and installing system package updates' "$manager" -y upgrade
-  [ -z "$hostname_arg" ] || run 'Setting the host name' hostnamectl set-hostname "$hostname_arg"
-  # One transaction installs both the core and the architecture's KVM runtime.
-  if [ "$manager" = apt-get ]; then
-    set -- -y --no-install-recommends install cloudmin-core cloudmin-kvm-stack
-  else
-    set -- -y --setopt=strict=1 --setopt=install_weak_deps=False \
-      --setopt=optional_metadata_types=filelists install @cloudmincore @cloudmin-kvm \
-      'cloudmin-config >= 10.0.0' 'webmin >= 2.670'
-  fi
-  for package in $(printf '%s' "$extra" | tr ',' ' '); do set -- "$@" "$package"; done
-  run 'Installing Cloudmin and the KVM stack' "$manager" "$@"
-  if [ "$manager" = apt-get ]; then
-    config_version=$(dpkg-query -W -f='${Version}' cloudmin-config) || fail 'cloudmin-config is missing'
-    webmin_version=$(dpkg-query -W -f='${Version}' webmin) || fail 'Webmin is missing'
-    run 'Checking the configuration package version' dpkg --compare-versions "$config_version" ge 10.0.0
-    run 'Checking the Webmin version' dpkg --compare-versions "$webmin_version" ge 2.670
-  else
-    run 'Checking the configuration package version' rpm -q --whatprovides 'cloudmin-config >= 10.0.0'
-    run 'Checking the Webmin version' rpm -q --whatprovides 'webmin >= 2.670'
-  fi
+  case "$package_type" in
+    rpm) bind_hook install_with_yum ;;
+    deb) bind_hook install_with_apt ;;
+    *) fatal "Unsupported package format: $package_type" ;;
+  esac
 }
 
 # post_install_message() Shows the login URL after installation succeeds.
 post_install_message() {
   log_success "Installation Complete!"
-  log_success "Cloudmin is ready at https://${hostname_arg:-$(hostname -f)}:10000."
+  log_success "Cloudmin is ready at https://${forcehostname:-$(hostname -f)}:10000."
   log_warning "You will see a security warning in the browser on your first visit."
 }
 
@@ -737,26 +803,31 @@ load_module() {
   bind_hook modules_post
 }
 
-# extra_phases() Runs tab-separated number, name, command and description rows.
+# extra_phases() Runs hooks__phases after the normal configuration phase.
+# Rows contain a phase number, name, command and description, separated
+# by tabs.
 extra_phases() {
   [ -n "$hooks__phases" ] || return 0
   bind_hook phases_pre || return $?
   printf '%s\n' "$hooks__phases" > "$CLOUDMIN_INSTALL_TEMPDIR/phases"
-  local number name command_text description previous=''
-  while IFS="$(printf '\t')" read -r number name command_text description; do
-    [ -n "$number" ] || continue
-    if [ "$number" != "$previous" ]; then
+  current_phase=
+  # Read in this shell so phase hooks can update installer state.
+  while IFS="$(printf '\t')" read -r phase_number phase_name command description; do
+    [ -n "$phase_number" ] || continue
+    # Print one heading per phase, even when it contains several commands.
+    if [ "$phase_number" != "$current_phase" ]; then
       printf '\n'
-      bind_hook phase "$name" "$number" || return $?
-      previous=$number
+      bind_hook phase "$phase_name" "$phase_number" || return $?
+      current_phase=$phase_number
     fi
-    run "$description" eval "$command_text" || return $?
+    run_ok "$command" "$description" || return $?
   done < "$CLOUDMIN_INSTALL_TEMPDIR/phases"
   bind_hook phases_post
 }
 
 # uninstall() Removes Cloudmin packages without deleting virtual machine data.
 uninstall() {
+  # Require confirmation unless unattended removal was explicitly requested.
   if [ "$skipyesno" -ne 1 ]; then
     cat <<EOF
 
@@ -764,18 +835,23 @@ uninstall() {
 
   This operation removes Cloudmin packages and repository configuration.
   Virtual machine disks and the shared Webmin installation are kept.
-  It must never be executed on a live production system!
+  Do not run this on a production host.
 
 EOF
     confirm " ${RED}Uninstall?${NORMAL} (y/N) " || return 0
   fi
   phases_total=1
   bind_hook phase Uninstall 1 || return $?
+  # Keep package configuration and shared dependencies during removal.
   if [ "$manager" = apt-get ]; then
-    run 'Uninstalling Cloudmin packages' apt-get -y remove cloudmin-core cloudmin-kvm-stack cloudmin-config webmin-server-manager
+    run_ok 'apt-get -y remove cloudmin-core cloudmin-kvm-stack cloudmin-config webmin-server-manager' \
+      'Uninstalling Cloudmin packages' || return $?
   else
-    run 'Uninstalling Cloudmin packages' dnf -y --setopt=clean_requirements_on_remove=False remove cloudmin-config webmin-server-manager
+    # Keep hypervisor packages and other dependencies that DNF might remove.
+    run_ok 'dnf -y --setopt=clean_requirements_on_remove=False remove cloudmin-config webmin-server-manager' \
+      'Uninstalling Cloudmin packages' || return $?
   fi
+  # Remove repository and authentication files, including old channel names.
   for repo in cloudmin cloudmin-stable cloudmin-unstable; do
     rm -f "/etc/apt/sources.list.d/$repo.list" "/etc/apt/sources.list.d/$repo.sources" \
       "/etc/apt/auth.conf.d/$repo.conf" "/etc/yum.repos.d/$repo.repo" || return $?
@@ -856,121 +932,161 @@ test_connection() {
 
 # check_connections() Tests repository connectivity without installing anything.
 check_connections() {
-  local host protocol result=0
-  for host in "$download_webmin_host_dev" "$download_cloudmin_host_dev"; do
-    for protocol in $connect; do test_connection "$host" "$protocol" || result=1; done
+  connection_result=0
+  for connection_host in "$download_webmin_host_dev" "$download_cloudmin_host_dev"; do
+    for connection_protocol in $connect; do
+      test_connection "$connection_host" "$connection_protocol" || connection_result=1
+    done
   done
-  return "$result"
+  return "$connection_result"
 }
 
-# main(args...) Runs installation or the requested standalone operation.
+# main([args...]) Runs installation or the requested standalone operation.
 main() {
-  bind_hook parse_args "$@" || fail 'Cannot parse installation options'
+  # Parse options and honor version requests before creating logs or task files.
+  bind_hook parse_args "$@" || fatal 'Cannot parse installation options'
   [ -z "$showversion" ] || { bind_hook show_version; return $?; }
+  # Allow repository setup callers to select setup-only mode through an
+  # environment variable.
   if [ "${CLOUDMIN_SETUP_ONLY:-0}" = 1 ]; then
-    setup=1; swap_only=; noswap=1; swapsize=; uninstall_mode=; connect=
+    setup_only=1; swap_only=; noswap=1; swapsize=; uninstall_mode=; connect=
   fi
+  # Exit early for connectivity checks or --swap-only with --no-swap.
   [ -z "$connect" ] || { bind_hook check_connections; return $?; }
   [ -z "$swap_only" ] || [ -z "$noswap" ] || { printf 'System swap left unchanged.\n'; return 0; }
-  bind_hook preflight || fail 'System checks failed'
-  script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || fail 'Cannot find installer directory'
-  [ -z "$module_name" ] || [ -f "$script_dir/$module_name.sh" ] || fail "Module not found: $module_name.sh"
+  # Check the host and locate any requested local module before setup starts.
+  bind_hook pre_check_all || fatal 'System checks failed'
+  script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || fatal 'Cannot find installer directory'
+  [ -z "$module_name" ] || [ -f "$script_dir/$module_name.sh" ] || fatal "Module not found: $module_name.sh"
+  # Keep new credentials and logs private and select a log for this operation.
   umask 077
-  mkdir -p -- "$log_dir" || fail 'Cannot create the log directory'
+  mkdir -p -- "$log_dir" || fatal 'Cannot create the log directory'
   log="$log_dir/cloudmin-install.log"
-  [ -z "$setup" ] || log="$log_dir/cloudmin-repos-setup.log"
+  [ -z "$setup_only" ] || log="$log_dir/cloudmin-repos-setup.log"
   [ -z "$uninstall_mode" ] || log="$log_dir/cloudmin-uninstall.log"
   [ -z "$swap_only" ] || log="$log_dir/cloudmin-swap.log"
   # Preserve logs from previous runs.
   if [ -e "$log" ]; then
     logcnt=1
     while [ -e "$log.$logcnt" ]; do logcnt=$((logcnt+1)); done
-    mv "$log" "$log.$logcnt" || fail 'Cannot rotate the log file'
+    mv "$log" "$log.$logcnt" || fatal 'Cannot rotate the log file'
   fi
-  touch "$log" || fail 'Cannot open the log file'
-  CLOUDMIN_INSTALL_TEMPDIR=$(mktemp -d /var/tmp/cloudmin-install.XXXXXX) || fail 'Cannot create temporary directory'
+  touch "$log" || fatal 'Cannot open the log file'
+  # Give downloads and progress files a private workspace with exit cleanup.
+  CLOUDMIN_INSTALL_TEMPDIR=$(mktemp -d /var/tmp/cloudmin-install.XXXXXX) || fatal 'Cannot create temporary directory'
   export CLOUDMIN_INSTALL_TEMPDIR
   trap finish EXIT
   trap 'exit 130' INT
   trap 'exit 143' HUP TERM
-  bind_hook load_slib || fail 'Cannot load the utility library'
+  # Load shared helpers before planning swap or showing installation prompts.
+  bind_hook download_slib || fatal 'Cannot load the utility library'
   disk_space_required=4
+  # Standalone swap exits before license, repository and package operations.
   if [ -n "$swap_only" ]; then
     log_info "Swap setup log is written to $LOG_PATH"
     log_info 'Started swap setup'
     swap_plan 0 || { log_error "$swap_error"; swap_abort; }
+    # An empty plan needs neither confirmation nor a swap operation.
     if [ "$swap_action" = none ]; then
       log_success 'System swap left unchanged.'
       return 0
     fi
+    # Show the planned size and require approval before modifying managed swap.
     log_info "$(swap_plan_message)" |
       sed "s/[0-9][0-9]* [GM]iB/${YELLOW}&${NORMAL}/g"
+    # Cancellation leaves swap untouched and exits successfully.
     if ! confirm 'Apply these swap changes? (y/n) '; then
       log_info 'Swap setup cancelled; system swap left unchanged.'
       return 0
     fi
     swap_setup 0 || swap_abort
-    log_success 'Swap setup completed successfully.'
+    log_success 'Swap setup complete.'
     return 0
   fi
+  # Removal has its own confirmation and must not configure new repositories.
   if [ -n "$uninstall_mode" ]; then
     log_info "Uninstallation log is written to $LOG_PATH"
-    bind_hook uninstall || fail "Uninstallation failed; see $log"
+    bind_hook uninstall || fatal "Uninstallation failed; see $log"
     return 0
   fi
-  if [ -n "$setup" ]; then
+  # Repository-only setup skips the installation banner and swap plan.
+  if [ -n "$setup_only" ]; then
     log_info "Setup log is written to $LOG_PATH"
     log_info 'Started Cloudmin 10 GPL software repositories setup'
   else
+    # Full installation includes its swap estimate in the confirmation summary.
     log_info "Installation log is written to $LOG_PATH"
     [ -n "$noswap" ] || swap_plan "$disk_space_required" || { log_error "$swap_error"; swap_abort; }
+    # --no-banner suppresses the summary and warning prompts together.
     if [ -z "$skipbanner" ]; then
-      bind_hook install_msg || fail 'Cannot display installation summary'
-      bind_hook unstable_repos_system_msg || fail 'Cannot display repository warning'
-      bind_hook preconfigured_system_msg || fail 'Cannot check pre-installed software'
-      bind_hook already_installed_msg || fail 'Cannot check existing installation'
+      bind_hook install_msg || fatal 'Cannot display installation summary'
+      bind_hook unstable_repos_system_msg || fatal 'Cannot display repository warning'
+      bind_hook preconfigured_system_msg || fatal 'Cannot check pre-installed software'
+      bind_hook already_installed_msg || fatal 'Cannot check existing installation'
     fi
   fi
-  bind_hook phases_all_pre || fail 'Installation hook failed'
-  if [ -z "$setup" ]; then
+  bind_hook phases_all_pre || fatal 'Installation hook failed'
+  # Only full installs show the host-check phase and apply the planned swap.
+  if [ -z "$setup_only" ]; then
     printf '\n'
-    bind_hook phase Check 1 || fail 'Phase hook failed'
-    bind_hook phase1_pre || fail 'Check hook failed'
-    run 'Checking operating system and KVM support' bind_hook preflight
-    bind_hook phase1_post || fail 'Check hook failed'
+    bind_hook phase Check 1 || fatal 'Phase hook failed'
+    bind_hook phase1_pre || fatal 'Check hook failed'
+    run_ok 'bind_hook pre_check_all' 'Checking operating system and KVM support' || fatal 'System checks failed'
+    bind_hook phase1_post || fatal 'Check hook failed'
+    # Begin host setup after the repeated preflight check succeeds.
     printf '\n'
-    bind_hook phase Setup 2 || fail 'Phase hook failed'
-    bind_hook phase2_pre || fail 'Setup hook failed'
+    bind_hook phase Setup 2 || fatal 'Phase hook failed'
+    bind_hook phase2_pre || fatal 'Setup hook failed'
     [ -n "$noswap" ] || swap_setup "$disk_space_required" || swap_abort
   fi
-  bind_hook repositories || fail "Repository setup failed; see $log"
-  if [ -n "$setup" ]; then
-    bind_hook phases_all_post || fail 'Setup hook failed'
-    log_success 'Cloudmin repository is configured successfully.'
+  # Install repository prerequisites before writing and refreshing repositories.
+  bind_hook preconfigure_cloudmin_release || fatal "Package manager setup failed; see $log"
+  bind_hook manage_cloudmin_branch_repos || fatal "Repository setup failed; see $log"
+  # Repository setup completes here without installing or configuring the stack.
+  if [ -n "$setup_only" ]; then
+    bind_hook phases_all_post || fatal 'Setup hook failed'
+    log_success 'Cloudmin repositories configured.'
     return 0
   fi
-  bind_hook phase2_post || fail 'Setup hook failed'
+  # Enter package installation after all setup work and its hooks complete.
+  bind_hook phase2_post || fatal 'Setup hook failed'
   printf '\n'
-  bind_hook phase Installation 3 || fail 'Phase hook failed'
-  bind_hook phase3_pre || fail 'Installation hook failed'
-  bind_hook install_cloudmin || fail "Package installation failed; see $log"
-  bind_hook phase3_post || fail 'Installation hook failed'
-  bind_hook load_module || fail 'Post-install module failed'
+  bind_hook phase Installation 3 || fatal 'Phase hook failed'
+  bind_hook phase3_pre || fatal 'Installation hook failed'
+  # Apply an explicit hostname before configuration uses it for host settings.
+  if [ -n "$forcehostname" ]; then
+    run_ok 'hostnamectl set-hostname "$forcehostname"' 'Setting the host name' || fatal 'Cannot set the host name'
+  fi
+  # Install the native stack, then load any trusted post-install module.
+  bind_hook install_cloudmin || fatal "Package installation failed; see $log"
+  bind_hook phase3_post || fatal 'Installation hook failed'
+  bind_hook load_module || fatal 'Post-install module failed'
+  # Configuration and readiness must finish before cleanup or a success message.
   printf '\n'
-  bind_hook phase Configuration 4 || fail 'Phase hook failed'
-  bind_hook phase4_pre || fail 'Configuration hook failed'
-  bind_hook configure || fail "Cloudmin configuration failed; see $log"
-  bind_hook phase4_post || fail 'Configuration hook failed'
-  bind_hook extra_phases || fail 'Additional installation phase failed'
-  bind_hook phases_all_post || fail 'Installation hook failed'
-  bind_hook clean_pre || fail 'Cleanup hook failed'
+  bind_hook phase Configuration 4 || fatal 'Phase hook failed'
+  bind_hook phase4_pre || fatal 'Configuration hook failed'
+  log_info 'Checking KVM appliance boot (3-minute timeout)'
+  # On failure, show recent diagnostics and stop before reporting success.
+  # The option helpers accept only literal plugin names.
+  # shellcheck disable=SC2086
+  if ! cloudmin-config-system --bundle "$bundle" $config_excludes $config_includes --log "$log"; then
+    tail -n 30 "$log" >&2
+    fatal "Cloudmin configuration or readiness failed; see $log"
+  fi
+  # Run extension phases only after the required configuration succeeds.
+  bind_hook phase4_post || fatal 'Configuration hook failed'
+  bind_hook extra_phases || fatal 'Additional installation phase failed'
+  bind_hook phases_all_post || fatal 'Installation hook failed'
+  # Leave the workspace before removing it and clear its path for the exit trap.
+  bind_hook clean_pre || fatal 'Cleanup hook failed'
   printf '%s▣▣▣%s Cleaning up\n' "$GREEN" "$NORMAL"
-  cd "$script_dir" || fail 'Cannot leave temporary directory'
-  rm -rf -- "$CLOUDMIN_INSTALL_TEMPDIR" || fail 'Cannot remove temporary directory'
+  cd "$script_dir" || fatal 'Cannot leave temporary directory'
+  rm -rf -- "$CLOUDMIN_INSTALL_TEMPDIR" || fatal 'Cannot remove temporary directory'
   CLOUDMIN_INSTALL_TEMPDIR=
-  bind_hook clean_post || fail 'Cleanup hook failed'
+  bind_hook clean_post || fatal 'Cleanup hook failed'
+  # Announce the login URL only after all phases and cleanup hooks succeed.
   printf '\n'
-  bind_hook post_install_message || fail 'Post-install message hook failed'
+  bind_hook post_install_message || fatal 'Post-install message hook failed'
 }
 
 main "$@"
