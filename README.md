@@ -13,6 +13,12 @@ sh cloudmin-install.sh --swap-only --swap 0
 sh cloudmin-install.sh --setup --yes
 ```
 
+`SERIAL` and `KEY` at the top of the script default to `GPL`. Set them there
+or through the environment to install Professional. When both remain `GPL`,
+the installer reuses credentials from `/etc/cloudmin-license`, if present.
+It saves the selected credentials before configuring repositories. GPL installs
+prefer GPL packages; Professional installs use the license to authenticate downloads.
+
 Cloudmin 10 currently uses only the `unstable` repository channel (`devel` is
 an alias). HTTPS download errors, missing packages and failed configuration
 steps stop installation.
@@ -39,11 +45,13 @@ from `download_webmin_host`. `--connect` checks the selected repository hosts.
 download_cloudmin_host_dev=mirror.example.com sh cloudmin-install.sh --setup --yes
 ```
 
-The script uses Webmin's current repository setup helper. On RPM hosts it
+The script uses the shared repository setup helper served at `/install`. On RPM hosts it
 enables CRB and EPEL, then installs `cloudmincore` and `cloudmin-kvm`. On Debian
 and Ubuntu it installs `cloudmin-core` and the native `cloudmin-kvm-stack` DEB;
 Ubuntu universe is enabled for the Perl virtualization bindings. Dependencies
-are installed in one transaction and failures stop the installer.
+for the core and KVM stack are installed together. On Debian and Ubuntu,
+Webmin is installed and configured first, before its modules run their
+pre-install checks. Failures stop the installer.
 Etckeeper is installed for configuration history. BIND and Postfix are not
 installed or configured; additional services can be managed through Webmin.
 
@@ -139,8 +147,10 @@ Available lifecycle hooks include `parse_args`, `usage`,
 `unstable_repos_system_msg`, `preconfigured_system_msg`, `phases_all_pre`,
 `phase1_pre` through `phase4_post`, `modules_pre`, `modules_post`, `phases_pre`,
 `phases_post`, `phases_all_post`, `clean_pre`, `clean_post` and
-`post_install_message`. Cloudmin also dispatches `preflight`, `repositories`,
-`install_cloudmin` and `configure` through `bind_hook`.
+`post_install_message`. The installer also dispatches `pre_check_all`, `download_slib`,
+`preconfigure_cloudmin_release`, `manage_cloudmin_branch_repos`,
+`install_cloudmin`, `install_with_apt` and `install_with_yum` through `bind_hook`.
+Use `phase4_pre` and `phase4_post` for hooks around configuration.
 
 A module can set `hooks__phases` to tab-separated rows containing a phase number,
 phase name, shell command and description, and set `phases_total` for the phase
