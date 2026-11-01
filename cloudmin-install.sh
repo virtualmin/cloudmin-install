@@ -78,20 +78,19 @@ fail() {
 
 # bind_hook(name, [args...]) Calls an override, or pre/original/post hooks.
 bind_hook() {
-  local hook="$1"
+  hook="$1"
   shift
+  # A full override replaces the original function and both surrounding hooks.
   if command -v "hook__$hook" >/dev/null 2>&1; then
     "hook__$hook" "$@"
   else
-    if command -v "pre_hook__$hook" >/dev/null 2>&1; then
-      "pre_hook__$hook" "$@" || return $?
-    fi
-    if command -v "$hook" >/dev/null 2>&1; then
-      "$hook" "$@" || return $?
-    fi
-    if command -v "post_hook__$hook" >/dev/null 2>&1; then
-      "post_hook__$hook" "$@" || return $?
-    fi
+    # Expand all names before dispatch so nested hooks keep the outer post-hook.
+    for hook in "pre_hook__$hook" "$hook" "post_hook__$hook"; do
+      # Missing lifecycle hooks are optional; failures stop this dispatch.
+      if command -v "$hook" >/dev/null 2>&1; then
+        "$hook" "$@" || return $?
+      fi
+    done
     return 0
   fi
 }
