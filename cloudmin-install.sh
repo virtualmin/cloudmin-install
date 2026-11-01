@@ -474,7 +474,8 @@ CLOUDMIN_LOGO_PNG
 
 install_msg() {
   supported="    ${CYANBG}${BLACK}${BOLD}Enterprise Linux and derivatives${NORMAL}${CYAN}
-      - AlmaLinux and Rocky Linux 10 on x86_64 and aarch64${NORMAL}
+      - AlmaLinux 10 on x86_64 and aarch64
+      - Rocky Linux 10 on x86_64 and aarch64${NORMAL}
     ${CYANBG}${BLACK}${BOLD}Debian Linux and derivatives${NORMAL}${CYAN}
       - Debian 13 on amd64 and arm64
       - Ubuntu 26.04 LTS on amd64 and arm64${NORMAL}"
