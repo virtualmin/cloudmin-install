@@ -6,7 +6,13 @@
 
 # Single-quoted run_ok commands expand their variables when executed.
 
+# Default to GPL unless the script or environment supplies Pro credentials.
+SERIAL="${SERIAL:-GPL}"
+KEY="${KEY:-GPL}"
 VER=10.0.0-RC1
+
+# Share saved credentials with the repository helper and License Manager.
+cloudmin_license_file="/etc/cloudmin-license"
 
 # Hide branch help and warnings during development; set to 0 to show them.
 # Removing this declaration also restores the normal branch help and warning.
@@ -476,7 +482,7 @@ install_logo() (
   case "$logo_cols:$logo_rows" in
     *[!0-9:]*|:*|*:) return 1 ;;
   esac
-  logo_heading="     Welcome to the Cloudmin GPL installer, version $VER"
+  logo_heading="     Welcome to the Cloudmin $PRODUCT installer, version $VER"
   [ "$logo_cols" -ge "${#logo_heading}" ] && [ "$logo_rows" -ge 16 ] || return 1
 
   # Reserve a row for iTerm2's cursor movement, then draw at the text margin.
@@ -553,7 +559,7 @@ install_msg() {
   printf '\n  '
   bind_hook install_logo || :
   cat <<EOF
-Welcome to the ${ORANGE}${BOLD}Cloudmin GPL${NORMAL} installer, version ${ORANGE}${BOLD}$VER${NORMAL}
+Welcome to the ${ORANGE}${BOLD}Cloudmin $PRODUCT${NORMAL} installer, version ${ORANGE}${BOLD}$VER${NORMAL}
 
   This script must be run on a freshly installed supported OS. It does not
   perform updates or upgrades (use your system package manager) or license
@@ -1009,10 +1015,29 @@ main() {
     bind_hook uninstall || fatal "Uninstallation failed; see $log"
     return 0
   fi
+  # Reuse saved credentials when no license was supplied.
+  if [ "$SERIAL" = GPL ] && [ "$KEY" = GPL ] && [ -f "$cloudmin_license_file" ]; then
+    cloudmin_license_existing_serial="$(grep 'SerialNumber=' "$cloudmin_license_file" | sed 's/SerialNumber=//')"
+    cloudmin_license_existing_key="$(grep 'LicenseKey=' "$cloudmin_license_file" | sed 's/LicenseKey=//')"
+    # Use saved credentials only when both the serial number and key exist.
+    if [ -n "$cloudmin_license_existing_serial" ] && [ -n "$cloudmin_license_existing_key" ]; then
+      SERIAL="$cloudmin_license_existing_serial"
+      KEY="$cloudmin_license_existing_key"
+    fi
+  fi
+  # Check the credential format without contacting the license server.
+  serial_ok "$SERIAL" "$KEY" || fatal 'Invalid license credentials'
+  # The selected edition controls the banner and repository authentication.
+  if [ "$SERIAL" = GPL ]; then
+    PRODUCT=GPL
+  else
+    # A non-GPL serial selects authenticated Professional package downloads.
+    PRODUCT=Professional
+  fi
   # Repository-only setup skips the installation banner and swap plan.
   if [ -n "$setup_only" ]; then
     log_info "Setup log is written to $LOG_PATH"
-    log_info 'Started Cloudmin 10 GPL software repositories setup'
+    log_info "Started repository setup for Cloudmin 10 $PRODUCT"
   else
     # Full installation includes its swap estimate in the confirmation summary.
     log_info "Installation log is written to $LOG_PATH"
@@ -1039,6 +1064,11 @@ main() {
     bind_hook phase2_pre || fatal 'Setup hook failed'
     [ -n "$noswap" ] || swap_setup "$disk_space_required" || swap_abort
   fi
+  # Save the selected license before configuring repository authentication.
+  log_debug "Saving serial number and license key to '$cloudmin_license_file'"
+  echo "SerialNumber=$SERIAL" > "$cloudmin_license_file" || fatal 'Cannot save the license'
+  echo "LicenseKey=$KEY" >> "$cloudmin_license_file" || fatal 'Cannot save the license'
+  chmod 700 "$cloudmin_license_file" || fatal 'Cannot protect the license file'
   # Install repository prerequisites before writing and refreshing repositories.
   bind_hook preconfigure_cloudmin_release || fatal "Package manager setup failed; see $log"
   bind_hook manage_cloudmin_branch_repos || fatal "Repository setup failed; see $log"
