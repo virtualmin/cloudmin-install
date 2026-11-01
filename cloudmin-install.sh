@@ -445,7 +445,7 @@ install_logo() (
   # Reserve a row for iTerm2's cursor movement, then draw at the text margin.
   printf '\n\033[1A\033[3G\0337'
   # Transparent 64x64 PNG from authentic-theme-src/.art/Logos/svgs/cloudmin.svg,
-  # rendered in Cloudmin orange and embedded to avoid a download.
+  # rendered in Cloudmin orange with smooth edges and embedded locally.
   awk -v protocol="$logo_protocol" '
     { data = data $0 }
     END {
@@ -460,13 +460,45 @@ install_logo() (
       }
     }
   ' <<'CLOUDMIN_LOGO_PNG'
-iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAAElBMVEX////mfjjmfjfmfjnmfzjl
-fjjCGAUrAAAAAXRSTlMAQObYZgAAAQRJREFUWMPtltsSwyAIRKFL//+X2ziTRAUR4lM7bjs+GPYE
-vIZo6y/FlfLuF/dK2cGGoHPE9zfJfZiFkxu7Qvl75VkPeCIx/Zm8dJwesSrxY+xYyqsFdq5CWkZl
-d3cXY0+uVxyaEPH9B0BKWxrcUF2/enZ28A1gFWTljAggPPsTQGhFWwBpAUgD0AJ4DuCrrUjnHHJO
-eghyfqwCaBFAiwB6CBAR6yiJzsJ4t4VSsLZrfCENAN1Spqzf3Y0U8esDrTEEANaJVF1emPppEjEH
-uKe6mib3Hd6dS/SMgBBgeGtfvSAKEy7GG25tHiG4BOOEiD/4ieMLa/ZDi595qpK8e2tr63f1ARDU
-BfC/l29+AAAAAElFTkSuQmCC
+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
+RU5ErkJggg==
 CLOUDMIN_LOGO_PNG
   # Start the welcome text on the same row, one space after the icon.
   printf '\0338\033[3C'
