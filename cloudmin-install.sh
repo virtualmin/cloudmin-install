@@ -26,54 +26,63 @@ download_cloudmin_host_dev="${download_cloudmin_host_dev:-$download_cloudmin_hos
 download_webmin_host="${download_webmin_host:-download.webmin.com}"
 download_webmin_host_dev="${download_webmin_host_dev:-download.webmin.dev}"
 
-# usage() Documents the supported installation and standalone swap controls.
+# usage() Lists installation options and standalone operations.
 usage() {
+  # Show defaults before the grouped option reference.
   # shellcheck disable=SC2046
   echo
   printf "Usage: %s [options]\\n" "$(basename "$0")"
   echo
-  echo "  If called without arguments, installs Cloudmin with default options."
+  echo "  Without options, installs Cloudmin with the default settings."
   echo
   printf "  --bundle|-b <KVM>                bundle to install (default: KVM)\\n"
   # Development builds use the unstable channel without advertising a switch.
   if [ "${CLOUDMIN_DEVELOPMENT:-0}" != 1 ]; then
-    printf "  --branch|-B <unstable>            install branch (default: unstable)\\n"
+    printf "  --branch|-B <unstable>           repository branch (default: unstable)\\n"
   fi
   echo
+  # Packages and plugins extend or narrow the selected bundle.
   printf "  --extra|-E <name[,name..]>       install extra packages with the stack\\n"
-  printf "  --exclude|-e <name[,name..]>     exclude plugin from configuration phase\\n"
-  printf "  --include|-i <name[,name..]>     include plugin in configuration phase\\n"
-  printf "  --module|-o <name>               load custom module in post-install phase\\n"
+  printf "  --exclude|-e <name[,name..]>     skip selected configuration plugins\\n"
+  printf "  --include|-i <name[,name..]>     run additional configuration plugins\\n"
+  printf "  --module|-o <name>               load local <name>.sh before configuration\\n"
   echo
-  printf "  --hostname|-n <name>             force hostname during install\\n"
+  # Hostname and update controls apply to full installation.
+  printf "  --hostname|-n <name>             set the host name during installation\\n"
   printf "  --no-package-updates|-x          skip package updates during install\\n"
   echo
+  # Swap can run alone, accompany installation, or be left unchanged.
   printf "  --swap|-S <size>                 managed swap: MiB or K/M/G[B]; 0 to remove\\n"
   printf "  --swap-only                      configure swap without installing\\n"
   printf "  --no-swap|-ns                    leave system swap unchanged\\n"
   echo
+  # Standalone operations do not run the full installation flow.
   printf "  --uninstall|-u                   remove Cloudmin packages and repositories\\n"
-  printf "  --setup|-s                       reconfigure repos without installing\\n"
-  printf "  --connect|-C <ipv4|ipv6>         test connectivity without installing\\n"
-  printf "  --insecure-downloads|-I          skip SSL certificate check for downloads\\n"
+  printf "  --setup|-s                       configure repositories and prerequisites\\n"
+  printf "  --connect|-C [ipv4|ipv6]         test connectivity (default: both)\\n"
+  printf "  --insecure-downloads|-I          skip certificate checks for installer downloads\\n"
   echo
   printf "  --log-dir <directory>            directory for installer logs\\n"
   echo
+  # Prompt, reinstall and display controls are independent choices.
   printf "  --force|-f|--yes|-y              assume \"yes\" to all prompts\\n"
-  printf "  --force-reinstall|-fr            force complete reinstall (not recommended)\\n"
-  printf "  --no-banner|-nb                  suppress installation messages and warnings\\n"
-  printf "  --verbose|-V                     enable verbose mode\\n"
+  printf "  --force-reinstall|-fr            allow reinstallation (not recommended)\\n"
+  printf "  --no-banner|-nb                  skip the installation banner and warnings\\n"
+  printf "  --verbose|-V                     show debug output\\n"
   echo
+  # Help and version requests exit before host checks.
   printf "  --version|-v                     show installer version\\n"
   printf "  --help|-h                        show this help\\n"
   echo
 }
 
-# Report argument errors before the shared logger is loaded.
+# log_error(message) Reports errors until slib replaces this logger.
 log_error() {
+  # Add color only when stderr is a terminal and terminal output is enabled.
   if [ -t 2 ] && [ "${INTERACTIVE_MODE:-}" != off ] && command -v tput >/dev/null 2>&1; then
     printf '%s[ERROR]%s %s\n' "$(tput setaf 1 2>/dev/null)" "$(tput sgr0 2>/dev/null)" "$1" >&2
   else
+    # Keep redirected errors readable before the shared logger is available.
     printf '[ERROR] %s\n' "$1" >&2
   fi
 }
@@ -259,7 +268,8 @@ show_version() {
   printf '%s\n' "$VER"
 }
 
-# supported_host(id, version, architecture) Keeps package selection explicit.
+# supported_host(id, version, architecture) Tests the supported OS matrix.
+# Use os-release ID and VERSION_ID, and the architecture reported by uname -m.
 supported_host() {
   case "$1:$3" in
     rocky:x86_64|rocky:aarch64|almalinux:x86_64|almalinux:aarch64)
@@ -298,16 +308,19 @@ pre_check_all() {
   command -v "$manager" >/dev/null 2>&1 || fatal "$manager is required"
 }
 
-# finish() Removes only this invocation's private workspace and keeps its exit status.
+# finish() Restores the terminal and removes this run's workspace on exit.
+# Preserve the exit status that triggered the trap.
 finish() {
   result=$?
   trap - EXIT HUP INT TERM QUIT
+  # Undo spinner and prompt terminal changes when slib enabled them.
   if [ "${INTERACTIVE_MODE:-off}" != off ]; then
     stty echo 2>/dev/null || :
     for pid in $allpids; do kill "$pid" 2>/dev/null || :; done
     tput cnorm 2>/dev/null || :
     tput sgr0 2>/dev/null || :
   fi
+  # Remove the workspace if main() has not already cleaned it up.
   [ -z "${CLOUDMIN_INSTALL_TEMPDIR:-}" ] || rm -rf -- "$CLOUDMIN_INSTALL_TEMPDIR"
   exit "$result"
 }
@@ -366,8 +379,9 @@ download_slib() {
   fi
 }
 
-# swap_abort() Is called by the shared library if its safety checks fail.
+# swap_abort() Stops installation after swap planning or setup fails.
 swap_abort() {
+  # Full installations can be retried with swap changes explicitly disabled.
   if [ -z "$swap_only" ]; then
     log_error "Re-run the installer with --no-swap${swapsize:+ instead of --swap} to skip swap setup."
   fi
@@ -435,18 +449,19 @@ manage_cloudmin_branch_repos() {
   fi
 }
 
+# phase(description, number) Shows progress within phases_total (default: 4).
 phase() {
     phases_total="${phases_total:-4}"
     phase_description="$1"
     phase_number="$2"
-    # Print completed phases (green)
+    # Show completed phases before the current phase marker.
     printf "${GREEN}"
     for i in $(seq 1 $(( phase_number - 1 ))); do
         printf "▣"
     done
-    # Print current phase (yellow)
+    # Distinguish the active phase from completed and pending work.
     printf "${YELLOW}▣"
-    # Print remaining phases (cyan)
+    # Keep pending phases visible until the final phase is reached.
     for i in $(seq $(( phase_number + 1 )) "$phases_total"); do
         printf "${CYAN}◻"
     done
@@ -454,7 +469,7 @@ phase() {
     printf "${NORMAL} Phase ${YELLOW}${phase_number}${NORMAL} of ${GREEN}${phases_total}${NORMAL}: ${phase_description}\\n"
 }
 
-# install_logo() displays an inline logo and leaves room for the welcome text.
+# install_logo() Draws an inline logo beside the welcome text.
 # Return 1 without output when the text banner should be used alone.
 install_logo() (
   # Keep images out of logs, unattended runs, and plain-output sessions.
@@ -547,7 +562,9 @@ CLOUDMIN_LOGO_PNG
   printf '\0338\033[3C'
 )
 
+# install_msg() Shows host requirements, the swap plan and install confirmation.
 install_msg() {
+  # Keep the displayed OS matrix consistent with supported_host().
   supported="    ${CYANBG}${BLACK}${BOLD}Enterprise Linux and derivatives${NORMAL}${CYAN}
       - AlmaLinux 10 on x86_64 and aarch64
       - Rocky Linux 10 on x86_64 and aarch64${NORMAL}
@@ -561,25 +578,27 @@ install_msg() {
   cat <<EOF
 Welcome to the ${ORANGE}${BOLD}Cloudmin $PRODUCT${NORMAL} installer, version ${ORANGE}${BOLD}$VER${NORMAL}
 
-  This script must be run on a freshly installed supported OS. It does not
-  perform updates or upgrades (use your system package manager) or license
-  changes (use System Settings / License Manager in Cloudmin).
+  Run this installer on a fresh, supported operating system. To update
+  an existing installation, use your package manager. To change licenses,
+  use System → Settings → License Manager in Cloudmin.
 
 EOF
+  # Show supported releases before the disk, swap and bundle summary.
   cat <<EOF
-  The systems currently supported by the install script are:
+  Supported operating systems:
 
 EOF
   echo "$supported"
-  # Include the optional swap plan in the installation summary below.
   swap_note=""
+  # Add a swap estimate only when this installation will manage swap.
   if [ "${SLIB_SWAP_API:-0}" = 2 ] && [ -z "$setup_only$noswap" ] &&
      swap_plan "$disk_space_required"; then
     swap_note=$(swap_plan_message)
   fi
+  # Link to the full compatibility requirements before asking to proceed.
   cat <<EOF
-  If your OS/version/arch is not listed, installation ${BOLD}${RED}will fail${NORMAL}. More
-  details about the systems supported by the script can be found here:
+  Installation ${BOLD}${RED}will fail${NORMAL} if your OS version or architecture is not listed.
+  See the full system requirements:
 
     ${UNDERLINE}https://www.cloudmin.com/docs/os-support/${NORMAL}
 
@@ -588,16 +607,17 @@ EOF
   # characters before adding color, keeping each size and its unit together.
   # The first input line contains the disk estimate; later sizes describe swap.
   printf '%s\n' \
-    "The installation will require up to $disk_space_required GiB of disk space." \
+    "Installation requires up to $disk_space_required GiB of disk space." \
     "${swap_note:+$swap_note }The selected" \
-    "package bundle is $bundle. More details" \
-    "about installation can be found here:" |
+    "package bundle is $bundle. See the" \
+    "installation guide:" |
     awk -v cyan="$CYAN" -v yellow="$YELLOW" -v normal="$NORMAL" \
         -v bundle="$bundle" '
       {
         for (i = 1; i <= NF; i++) {
           word = $i
           display = word
+          # Keep sizes and units together; do not count color codes as text.
           if (word ~ /^[0-9]+$/ && i < NF && $(i + 1) ~ /^[GM]iB[.]?$/) {
             unit = $(++i)
             suffix = (unit ~ /[.]$/ ? "." : "")
@@ -606,8 +626,10 @@ EOF
             display = (NR == 1 ? cyan : yellow) word normal suffix
             word = word suffix
           } else if (word == bundle ".") {
+            # Highlight the bundle name without changing its printed width.
             display = cyan bundle normal "."
           }
+          # Wrap on word boundaries while preserving the two-space left margin.
           if (column && column + 1 + length(word) > 70) {
             printf "\n"
             column = 0
@@ -624,19 +646,23 @@ EOF
 
 EOF
 
+  # Interactive users can leave now to review options before changes begin.
   if [ "$skipyesno" -ne 1 ]; then
   cat <<EOF
-  Exit and re-run this script with ${CYAN}--help${NORMAL} flag to see available options.
+  To see all options, exit and run this script with ${CYAN}--help${NORMAL}.
 
 EOF
   fi
+  # --yes skips this confirmation along with the other installation prompts.
   if [ "$skipyesno" -ne 1 ]; then
+    # Declining the summary exits before any package or swap changes.
     if ! confirm " Continue? (y/n) "; then
       exit
     fi
   fi
 }
 
+# unstable_repos_system_msg() Warns about unstable packages outside development.
 unstable_repos_system_msg() {
   # Development builds skip the unstable warning and its extra confirmation.
   if [ "${CLOUDMIN_DEVELOPMENT:-0}" != 1 ] && [ "$branch" = "unstable" ]; then
@@ -644,14 +670,14 @@ unstable_repos_system_msg() {
 
   ${REDBG}${WHITE}${BOLD} DANGER ${NORMAL}
 
-  You have enabled the unstable development branch, where packages are built
-  automatically with every commit to the repositories of each product we
-  offer. This branch is strictly for testing and development purposes
-  and must not be used in a production environment!
+  The unstable branch contains development builds. Use it only for
+  testing, not on production systems.
 
 EOF
 
+    # Ask interactive users to accept the unstable branch explicitly.
     if [ "$skipyesno" -ne 1 ]; then
+      # Declining stops installation before repository setup.
       if ! confirm " Continue with $branch branch? (y/n) "; then
         exit
       fi
@@ -659,9 +685,11 @@ EOF
   fi
 }
 
+# preconfigured_system_msg() Warns about software that may conflict with setup.
 preconfigured_system_msg() {
-  # Double check if installed, just in case above error ignored.
+  # Detect service tools that suggest this is not a fresh operating system.
   is_preconfigured_rs=$(is_preconfigured)
+  # Warn when a detected tool suggests services may already be configured.
   if [ -n "$is_preconfigured_rs" ]; then
     cat <<EOF
 
@@ -669,14 +697,14 @@ preconfigured_system_msg() {
 
   Pre-installed software detected: $is_preconfigured_rs
 
-  It is highly advised ${BOLD}${RED}not to pre-install${NORMAL} any additional packages on your
-  OS. The installer expects a freshly installed OS, and anything you do
-  differently might cause conflicts or configuration errors. If you need
-  to enable third-party package repositories, do so after installation
-  of Cloudmin, and only with extreme caution.
+  The installer expects a ${BOLD}${RED}fresh operating system${NORMAL}. Existing services
+  may conflict with its configuration. Add third-party repositories
+  only after installation, and check their compatibility first.
 
 EOF
+    # --yes accepts the warning; interactive users choose whether to proceed.
     if [ "$skipyesno" -ne 1 ]; then
+      # Declining preserves the existing software without starting setup.
       if ! confirm " Continue? (y/n) "; then
         exit
       fi
@@ -684,57 +712,66 @@ EOF
   fi
 }
 
+# is_preconfigured() Prints detected service tools for the pre-install warning.
 is_preconfigured() {
   preconfigured=""
+  # BIND suggests the host may already provide DNS service.
   if named -v 1>/dev/null 2>&1; then
     preconfigured="${preconfigured}${YELLOW}${BOLD}BIND${NORMAL} "
   fi
+  # Apache can indicate an existing web hosting stack.
   if apachectl -v 1>/dev/null 2>&1; then
     preconfigured="${preconfigured}${YELLOW}${BOLD}Apache${NORMAL} "
   fi
+  # Check Nginx independently because both web servers may be installed.
   if nginx -v 1>/dev/null 2>&1; then
     preconfigured="${preconfigured}${YELLOW}${BOLD}Nginx${NORMAL} "
   fi
+  # The MariaDB client is a signal of pre-installed database software.
   if command -pv mariadb 1>/dev/null 2>&1; then
     preconfigured="${preconfigured}${YELLOW}${BOLD}MariaDB${NORMAL} "
   fi
+  # Postfix can indicate an existing mail service configuration.
   if postconf mail_version 1>/dev/null 2>&1; then
     preconfigured="${preconfigured}${YELLOW}${BOLD}Postfix${NORMAL} "
   fi
+  # PHP is another sign that the host may already run web applications.
   if php -v 1>/dev/null 2>&1; then
     preconfigured="${preconfigured}${YELLOW}${BOLD}PHP${NORMAL} "
   fi
+  # Return a comma-separated display list to the warning caller.
   preconfigured=$(echo "$preconfigured" | sed 's/ /, /g' | sed 's/, $/ /')
   echo "$preconfigured"
 }
 
-# is_installed() Detects an existing Cloudmin installation.
+# is_installed() Tests whether the Cloudmin module configuration exists.
 is_installed() {
   [ -f /etc/webmin/server-manager/config ]
 }
 
+# already_installed_block() Rejects an unrequested reinstall with exit code 100.
 already_installed_block() {
-  log_error "Your system already has a successful Cloudmin installation deployed."
-  log_error "Re-installation is neither possible nor necessary. This script must be"
-  log_error "run on a freshly installed supported operating system. It is not meant"
-  log_error "for package updates or license changes. For further assistance, please"
-  log_error "visit the Cloudmin Community forum."
+  log_error "Cloudmin is already installed on this system."
+  log_error "This installer is intended for a fresh, supported operating system."
+  log_error "Use your package manager for updates."
+  log_error "Change licenses in System → Settings → License Manager."
+  log_error "Use --force-reinstall only if you intend to rerun installation."
   exit 100
 }
 
 # already_installed_msg() Warns before an explicitly requested reinstall.
 already_installed_msg() {
+  # Explain the limits of the requested reinstall before making changes.
   if is_installed; then
     cat <<EOF
 
   ${WHITEBG}${RED}${BOLD} WARNING ${NORMAL}
 
-  If Cloudmin is already installed successfully, ${BOLD}${RED}do not${NORMAL} run this
-  script again to fix problems, upgrade, or change the license!
+  Cloudmin is already installed. ${BOLD}${RED}Do not reinstall${NORMAL} to fix problems,
+  apply updates or change licenses.
 
-  Updates and upgrades must be performed from within Cloudmin or by
-  using your system package manager on the command line.
-  Change licenses in System Settings / License Manager.
+  Use your package manager for updates.
+  Change licenses in System → Settings → License Manager.
 
 EOF
     confirm ' Continue? (y/n) ' || exit 0
@@ -798,10 +835,11 @@ install_cloudmin() {
 post_install_message() {
   log_success "Installation Complete!"
   log_success "Cloudmin is ready at https://${forcehostname:-$(hostname -f)}:10000."
-  log_warning "You will see a security warning in the browser on your first visit."
+  log_warning "Your browser may show a certificate warning on the first visit."
 }
 
-# load_module() Loads a local module before configuration starts.
+# load_module() Sources the selected local module before configuration.
+# Modules and their hooks run as trusted shell code with installer privileges.
 load_module() {
   [ -n "$module_name" ] || return 0
   bind_hook modules_pre || return $?
@@ -867,6 +905,8 @@ EOF
   log_success 'Cloudmin uninstallation complete.'
 }
 
+# test_connection(host_or_url, ip_version) Checks DNS, ICMP and HTTP access.
+# ip_version must be ipv4 or ipv6; HTTP client timeouts are set to 5 seconds.
 test_connection() {
   input="$1"
   ip_version="$2"
@@ -875,8 +915,9 @@ test_connection() {
   http_protocol="http"
   http_protocol_nice=$(echo "$http_protocol" | tr '[:lower:]' '[:upper:]')
 
-  # Setup colors for messages
+  # This standalone diagnostic runs before slib initializes terminal colors.
   GREEN="" BLACK="" RED="" RESET="" BOLD="" GRBG="" REDBG=""
+  # Use terminal capabilities when available; otherwise retain plain labels.
   if command -pv 'tput' > /dev/null; then
     GREEN=$(tput setaf 2)
     BLACK=$(tput setaf 0)
@@ -887,19 +928,20 @@ test_connection() {
     REDBG=$(tput setab 52; tput setaf 9)
   fi
 
-  # Extract the domain from the input
+  # Extract the host name from a URL, or use a bare host name.
   domain=$(echo "$input" | awk -F[/:] '{print $4}')
   [ -z "$domain" ] && domain="$input"
 
-  # Validate parameters
+  # Both the host and IP version are required for the checks.
   if [ -z "$domain" ] || [ -z "$ip_version" ]; then
     echo "${RED}[ERROR]  ${RESET} Domain and IP version are required" >&2
     return 1
   fi
 
-  # Setup protocol-specific flags
+  # Check DNS resolution before testing connectivity over IPv4 or IPv6.
   case "$ip_version" in
     ipv4)
+      # Stop IPv4 checks if the resolver cannot supply an address.
       if ! getent ahostsv4 "$domain" >/dev/null 2>&1; then
         echo "${RED}[ERROR]  ${RESET} ${BOLD}$domain${RESET} — cannot find IPv4 address" >&2
         return 1
@@ -909,6 +951,7 @@ test_connection() {
         || wget --spider -4 -T $timeout $http_protocol://$domain"
       ;;
     ipv6)
+      # Stop IPv6 checks if the resolver cannot supply an address.
       if ! getent ahostsv6 "$domain" >/dev/null 2>&1; then
         echo "${RED}[ERROR]  ${RESET} ${BOLD}$domain${RESET} — cannot find IPv6 address" >&2
         return 1
@@ -919,19 +962,22 @@ test_connection() {
       ;;
   esac
 
-  # Try ping first
+  # Report ICMP reachability separately from HTTP access.
   if eval "$ping_cmd" >/dev/null 2>&1; then
     echo "${GREEN}[SUCCESS]${RESET} ${GRBG}[$ip_version_nice]${RESET} ${GRBG}[ICMP]${RESET} ${BOLD}$domain${RESET}"
   else
+    # A failed ping does not prevent checking HTTP, which may still be allowed.
     echo "${RED}[ERROR]  ${RESET} ${REDBG}[$ip_version_nice]${RESET} ${REDBG}[ICMP]${RESET} ${BOLD}$domain${RESET}"
   fi
 
-  # HTTP test as well
+  # Check plain HTTP when a client is available; TLS and login are not tested.
   if command -v 'curl' > /dev/null || command -v 'wget' > /dev/null; then
+    # Report success when curl or its wget fallback completes the HTTP probe.
     if eval "$http_cmd" >/dev/null 2>&1; then
       echo "${GREEN}[SUCCESS]${RESET} ${GRBG}[$ip_version_nice]${RESET} ${GRBG}[$http_protocol_nice]${RESET} ${BOLD}$domain${RESET}"
       return 0
     else
+      # Return failure so the caller can aggregate failures across hosts.
       echo "${RED}[ERROR]  ${RESET} ${REDBG}[$ip_version_nice]${RESET} ${REDBG}[$http_protocol_nice]${RESET} ${BOLD}$domain${RESET}"
       return 1
     fi
