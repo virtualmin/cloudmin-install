@@ -600,7 +600,7 @@ EOF
   Installation ${BOLD}${RED}will fail${NORMAL} if your OS version or architecture is not listed.
   See the full system requirements:
 
-    ${UNDERLINE}https://www.cloudmin.com/docs/os-support/${NORMAL}
+    ${UNDERLINE}https://cloudmin.com/docs/os-support/${NORMAL}
 
 EOF
   # Wrap the complete paragraph to match the surrounding text. Count plain
@@ -642,7 +642,7 @@ EOF
     '
   cat <<EOF
 
-    ${UNDERLINE}https://www.cloudmin.com/docs/installation/automated/${NORMAL}
+    ${UNDERLINE}https://cloudmin.com/docs/installation/automated/${NORMAL}
 
 EOF
 
