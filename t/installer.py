@@ -180,11 +180,13 @@ install_cloudmin
                     else:
                         removal = ('apt-get --quiet --assume-yes purge ufw firewalld' if kind == 'deb'
                                    else 'dnf -y remove firewalld')
-                        self.assertEqual(steps, ([] if skip_updates else [upgrade]) + [
+                        expected = ([] if skip_updates else [upgrade]) + [
                             'REMOVE ' + removal,
-                            'STEP Installing Cloudmin and the KVM stack',
-                            'STEP Checking the configuration package version',
-                            'STEP Checking the Webmin version'])
+                            'STEP Installing Cloudmin and the KVM stack']
+                        if kind == 'deb':
+                            expected += ['STEP Checking the configuration package version',
+                                         'STEP Checking the Webmin version']
+                        self.assertEqual(steps, expected)
                         self.assertIn('Firewall removal output', log.read_text())
                         self.assertIn('Firewall removal diagnostic', log.read_text())
 
@@ -285,7 +287,8 @@ main --yes --no-swap --log-dir "$TEST_DIR" --include Etckeeper,Fail2ban --exclud
                     self.assertNotIn('dnf ', p.stdout)
                 else:
                     self.assertIn('@cloudmincore @cloudmin-kvm', p.stdout)
-                    self.assertIn('rpm -q --whatprovides', p.stdout)
+                    self.assertIn("'cloudmin-config >= 10.0.0' 'webmin >= 2.670'", p.stdout)
+                    self.assertNotIn('rpm -q --whatprovides', p.stdout)
         for stage in ['swap', 'package', 'config', 'repository']:
             with tempfile.TemporaryDirectory(dir='/tmp') as d:
                 p = self.shell(harness, d, stage, 'dnf')

@@ -808,7 +808,7 @@ install_with_apt() {
     'Checking the Webmin version' || return $?
 }
 
-# install_with_yum() Installs the RPM groups and checks required tool versions.
+# install_with_yum() Installs the RPM groups with required minimum versions.
 install_with_yum() {
   # Apply distribution updates unless the caller explicitly skipped them.
   if [ -z "$noupdates" ]; then
@@ -817,14 +817,9 @@ install_with_yum() {
   # Remove firewalld before installing the nftables-based stack.
   $install_cmd -y remove firewalld >> "$RUN_LOG" 2>&1
 
-  # Resolve both groups and optional packages in one dependency transaction.
+  # Let DNF enforce minimum versions while resolving both groups and extras.
   run_ok "$install @cloudmincore @cloudmin-kvm 'cloudmin-config >= 10.0.0' 'webmin >= 2.670' $extra_packages" \
     'Installing Cloudmin and the KVM stack' || return $?
-  # Confirm the installed packages meet the requested minimum versions.
-  run_ok "rpm -q --whatprovides 'cloudmin-config >= 10.0.0'" \
-    'Checking the configuration package version' || return $?
-  run_ok "rpm -q --whatprovides 'webmin >= 2.670'" \
-    'Checking the Webmin version' || return $?
 }
 
 # install_cloudmin() Selects the installation routine for the package format.
