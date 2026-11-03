@@ -42,9 +42,6 @@ jobs:
       - name: Fetch dependencies
         run: curl -O ${{ env.BUILD_BOOTSTRAP }}
 
-      - name: Set timezone
-        run: sudo timedatectl set-timezone ${{ env.TZ }}
-
       - name: Upload file
         env:
           CLOUD__IP_ADDR: ${{ secrets.DEV_IP_ADDR }}
